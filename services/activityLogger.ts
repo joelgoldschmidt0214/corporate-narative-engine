@@ -1,5 +1,3 @@
-import type {} from "node:fs";
-
 type EventPayload = Record<string, any>;
 
 const isNode =
@@ -13,11 +11,12 @@ let fs: any = null;
 let path: any = null;
 
 if (isNode) {
-  // require lazily so bundlers don't include fs for browser builds
+  // Use standard ESM imports at runtime for Node execution
+  // This keeps the file ESM-compatible while still allowing file writes in CLI runs.
   // eslint-disable-next-line @typescript-eslint/no-var-requires
-  fs = require("fs");
+  fs = await import("fs");
   // eslint-disable-next-line @typescript-eslint/no-var-requires
-  path = require("path");
+  path = await import("path");
   LOG_DIR = path.join(process.cwd(), "debug", "logs");
   LOG_FILE = path.join(LOG_DIR, "activity.log");
 }

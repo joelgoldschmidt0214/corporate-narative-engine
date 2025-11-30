@@ -1,16 +1,26 @@
 import { GoogleGenAI } from "@google/genai";
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
-import {
+import type {
   CompanyInput,
   YearlyData,
-  DocumentType,
+  DocumentType as _DocumentType,
   GeneratedDocument,
   DetailedFinancials,
   FinancialSection,
 } from "../types";
-import { logger } from "./logger";
-import activityLogger from "./activityLogger";
+import { logger } from "./logger.ts";
+import activityLogger from "./activityLogger.ts";
+
+// Provide a runtime-safe DocumentType mapping to avoid importing the project's
+// TypeScript `enum` at runtime (which breaks `ts-node` strip-only mode).
+export const DocumentType = {
+  BS: "BS",
+  PL: "PL",
+  CF: "CF",
+  JE: "JE",
+  NEWSLETTER: "NEWSLETTER",
+} as const;
 import * as fs from "fs";
 import * as path from "path";
 
@@ -20,10 +30,29 @@ const nowMs = () =>
     ? performance.now()
     : Date.now();
 const getClient = () => {
-  const apiKey = process.env.API_KEY;
-  if (!apiKey) {
-    throw new Error("API Key is missing. Please set process.env.API_KEY.");
+  // Support multiple env var names depending on how the project is run.
+  // Prefer GEMINI_API_KEY, then API_KEY, then VITE-prefixed variants via import.meta
+  let apiKey: string | undefined = undefined;
+
+  if (typeof process !== "undefined" && process.env) {
+    apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY || undefined;
   }
+
+  // Check Vite-style env if available (only in bundler/browser build)
+  if (!apiKey && typeof import.meta !== "undefined") {
+    apiKey =
+      (import.meta as any).env?.GEMINI_API_KEY ||
+      (import.meta as any).env?.VITE_GEMINI_API_KEY ||
+      (import.meta as any).env?.VITE_API_KEY ||
+      undefined;
+  }
+
+  if (!apiKey) {
+    throw new Error(
+      "API Key is missing. Please set GEMINI_API_KEY or API_KEY in your environment."
+    );
+  }
+
   return new GoogleGenAI({ apiKey });
 };
 
@@ -85,8 +114,348 @@ const safeParseJson = (text: string): any => {
   }
 };
 
+// Normalization helpers for common malformed shapes returned by the model
+const normalizeNewsletters = (
+  parsed: any,
+  rawText: string,
+  inputYears: number[]
+): any => {
+  if (!parsed) return ensureYearMonths(parsed);
+  // If no newsletters key, nothing to do here
+  if (!parsed.newsletters) return parsed;
+
+  const items = parsed.newsletters;
+  if (!Array.isArray(items)) return parsed;
+
+  // Handle common pattern: alternating [year, content, year, content, ...]
+  const isAlternatingYearContent =
+    Array.isArray(items) &&
+    items.length >= 2 &&
+    items.every((el: any, idx: number) =>
+      idx % 2 === 0
+        ? typeof el === "number" ||
+          (typeof el === "string" && /^\d{4}$/.test(el))
+        : typeof el === "string"
+    );
+  if (isAlternatingYearContent) {
+    const out: any[] = [];
+    for (let i = 0; i < items.length; i += 2) {
+      const rawYear = items[i];
+      const year =
+        typeof rawYear === "number" ? rawYear : Number(String(rawYear).trim());
+      const content = String(items[i + 1] || "").trim();
+      out.push({ year: Number(year), content });
+    }
+    parsed.newsletters = out;
+    return parsed;
+  }
+
+  // If the array contains an embedded JSON string (e.g. many nulls and one
+  // long JSON string), parse and prefer that payload which often contains
+  // the correct `newsletters` array.
+  for (const el of items) {
+    if (typeof el === "string") {
+      const trimmed = el.trim();
+      if (
+        trimmed.startsWith("{") ||
+        trimmed.includes('"newsletters"') ||
+        trimmed.includes('"year"')
+      ) {
+        try {
+          const candidate = safeParseJson(trimmed);
+          if (
+            candidate &&
+            candidate.newsletters &&
+            Array.isArray(candidate.newsletters)
+          ) {
+            parsed.newsletters = candidate.newsletters;
+            return parsed;
+          }
+        } catch (_e) {
+          // ignore and continue
+        }
+      }
+    }
+  }
+
+  const isPrimitiveArray = items.every(
+    (it: any) => typeof it !== "object" || it === null
+  );
+  if (isPrimitiveArray) {
+    // Try extracting by searching for year markers inside the raw response
+    const joined = items.join(" ");
+    const out: any[] = [];
+    for (let i = 0; i < inputYears.length; i++) {
+      const year = inputYears[i];
+      const yearStr = String(year);
+      let content = "";
+      const pos = joined.indexOf(yearStr);
+      if (pos !== -1) {
+        // Try to find the 'content' token after the year
+        const contentToken = joined.indexOf("content", pos);
+        if (contentToken !== -1) {
+          const after = joined.slice(contentToken);
+          const colon = after.indexOf(":");
+          const snippet = colon !== -1 ? after.slice(colon + 1) : after;
+          // determine next year position inside snippet
+          let nextPos = -1;
+          for (const y2 of inputYears) {
+            const p = snippet.indexOf(String(y2));
+            if (p !== -1 && (nextPos === -1 || p < nextPos)) nextPos = p;
+          }
+          const rawContent =
+            nextPos !== -1 ? snippet.slice(0, nextPos) : snippet;
+          content = rawContent
+            .replace(/[\"{}\[\]]/g, "")
+            .replace(/\s+/g, " ")
+            .trim();
+        } else {
+          // Fallback: take fixed-length snippet after the year
+          const after = joined.slice(
+            pos + yearStr.length,
+            pos + yearStr.length + 400
+          );
+          content = after.replace(/[\"{}\[\]]/g, "").trim();
+        }
+      } else {
+        // If year not found in joined text, fall back to the primitive at same index
+        const el = items[i];
+        content = typeof el === "string" ? el : String(el || "");
+      }
+      out.push({ year: Number(year), content: content });
+    }
+    parsed.newsletters = out;
+    return parsed;
+  }
+
+  // If array contains only numbers (garbage numeric tokens), try extracting
+  // year-marked blocks from raw text as a last resort.
+  const allNumbers = items.every((it: any) => typeof it === "number");
+  if (allNumbers) {
+    const out2: any[] = [];
+    const text = String(rawText || "");
+    for (const y of inputYears) {
+      const marker1 = `Year:${y}`;
+      const marker2 = `${y}`;
+      const pos = text.indexOf(marker1);
+      const pos2 = pos === -1 ? text.indexOf(marker2) : pos;
+      if (pos2 !== -1) {
+        // take up to next Year: or 400 chars
+        const next = text.indexOf("Year:", pos2 + 1);
+        const slice =
+          next !== -1 ? text.slice(pos2, next) : text.slice(pos2, pos2 + 400);
+        const cleaned = slice
+          .replace(/^[^\n]*\n?/, "")
+          .replace(/["{}\[\]]/g, "")
+          .trim();
+        out2.push({ year: Number(y), content: cleaned });
+      } else {
+        out2.push({ year: Number(y), content: "" });
+      }
+    }
+    if (out2.length > 0) {
+      parsed.newsletters = out2;
+      return parsed;
+    }
+  }
+
+  // If some items are objects but missing years, fill by inputYears by order
+  const mapped = items.map((it: any, idx: number) => {
+    if (it && typeof it === "object") {
+      if (it.year == null) it.year = inputYears[idx] || null;
+      if (it.content == null) it.content = String(it || "");
+      return it;
+    }
+    return { year: inputYears[idx] || null, content: String(it || "") };
+  });
+
+  // If many entries are missing year, attempt to extract Year:YYYY blocks from rawText
+  const nullCount = mapped.filter((m: any) => m.year == null).length;
+  if (nullCount > 0) {
+    try {
+      const blocks: any[] = [];
+      const regex = /Year[:\s]*([0-9]{4})/g;
+      const matches = [...String(rawText || "").matchAll(regex)];
+      if (matches.length > 0) {
+        for (let i = 0; i < matches.length; i++) {
+          const m = matches[i];
+          const year = Number(m[1]);
+          const start = m.index || 0;
+          const end = matches[i + 1]
+            ? matches[i + 1].index
+            : String(rawText || "").length;
+          const slice = String(rawText || "").slice(start, end);
+          const content = slice
+            .replace(regex, "")
+            .replace(/["{}\[\]]/g, "")
+            .replace(/\s+/g, " ")
+            .trim();
+          blocks.push({ year: Number(year), content });
+        }
+      }
+      if (blocks.length > 0) {
+        parsed.newsletters = blocks;
+        return parsed;
+      }
+    } catch (_e) {
+      // ignore and continue to other fallbacks
+    }
+
+    // Fallback: collect string entries and map them to inputYears by order
+    const stringContents = items
+      .filter((it: any) => typeof it === "string")
+      .map((s: any) => String(s).trim());
+    if (stringContents.length >= inputYears.length) {
+      parsed.newsletters = inputYears.map((y: number, idx: number) => ({
+        year: Number(y),
+        content: stringContents[idx] || "",
+      }));
+      return parsed;
+    }
+  }
+
+  parsed.newsletters = mapped;
+  return parsed;
+};
+
+const normalizeJE = (
+  parsed: any,
+  rawText: string,
+  inputYears: number[]
+): any => {
+  if (!parsed) return parsed;
+  // If top-level contains entries_by_year or all_years_data (common fallback), synthesize parsed.years
+  if (!Array.isArray(parsed.years)) {
+    if (
+      Array.isArray(parsed.entries_by_year) &&
+      parsed.entries_by_year.length > 0
+    ) {
+      parsed.years = parsed.entries_by_year.map((s: any) => {
+        if (typeof s === "string") {
+          const m = s.match(/Year:\s*(\d{4})/);
+          const year = m ? Number(m[1]) : null;
+          return { year, months: [] };
+        }
+        return { year: Number(s) || null, months: [] };
+      });
+    } else if (
+      Array.isArray(parsed.all_years_data) &&
+      parsed.all_years_data.length > 0
+    ) {
+      parsed.years = parsed.all_years_data.map((s: any) => {
+        if (typeof s === "string") {
+          const m = s.match(/Year:\s*(\d{4})/);
+          const year = m ? Number(m[1]) : null;
+          return { year, months: [] };
+        }
+        return { year: Number(s) || null, months: [] };
+      });
+    } else {
+      return ensureYearMonths(parsed);
+    }
+  }
+
+  const items = parsed.years;
+  const first = items[0];
+  if (first && typeof first === "object") return ensureYearMonths(parsed); // already objects
+
+  // If items are primitives, try to find explicit year markers in the raw text
+  const joined = Array.isArray(items) ? items.join(" ") : String(items || "");
+  const out: any[] = [];
+  // Prefer inputYears as canonical years; if raw contains those markers, use them
+  for (const y of inputYears) {
+    const ys = String(y);
+    if (joined.indexOf(ys) !== -1 || String(items).indexOf(ys) !== -1) {
+      out.push({ year: Number(y), months: [] });
+    }
+  }
+
+  // If we didn't detect any year markers, fall back to mapping numeric primitives that look like years
+  if (out.length === 0) {
+    for (const it of items) {
+      if (typeof it === "number" && it > 1900 && it < 2100) {
+        out.push({ year: Number(it), months: [] });
+      } else if (typeof it === "string" && /^\d{4}$/.test(it.trim())) {
+        out.push({ year: Number(it.trim()), months: [] });
+      }
+    }
+  }
+
+  // As a last resort, ensure we produce at least one object per input year (empty months)
+  if (out.length === 0) {
+    for (const y of inputYears) out.push({ year: Number(y), months: [] });
+  }
+
+  parsed.years = out;
+  return ensureYearMonths(parsed);
+};
+
+// Ensure each year object has a months array with expected shape (title + items)
+// This helps downstream zod validation when the model returns years without
+// populated months (common when it returns summaries instead of full journals).
+const ensureYearMonths = (parsed: any) => {
+  if (!parsed || !Array.isArray(parsed.years)) return parsed;
+  const monthTitles: string[] = Array.isArray(parsed.months)
+    ? parsed.months.map((m: any) => String(m))
+    : [
+        "4月",
+        "5月",
+        "6月",
+        "7月",
+        "8月",
+        "9月",
+        "10月",
+        "11月",
+        "12月",
+        "1月",
+        "2月",
+        "3月",
+      ];
+
+  parsed.years = parsed.years.map((y: any) => {
+    if (!y || typeof y !== "object") return y;
+    if (!Array.isArray(y.months) || y.months.length === 0) {
+      y.months = monthTitles.map((t) => ({ title: t, items: [] }));
+    } else {
+      // Normalize existing months to have title + items
+      y.months = y.months.map((m: any) => {
+        if (!m || typeof m !== "object")
+          return { title: String(m || ""), items: [] };
+        if (!Array.isArray(m.items)) m.items = [];
+        if (!m.title) m.title = String(m.title || "");
+        return m;
+      });
+    }
+    return y;
+  });
+  return parsed;
+};
+
 const saveDebugResponse = (prefix: string, text: string) => {
   try {
+    // Only attempt to write files when running under Node with a valid CWD.
+    if (
+      typeof process === "undefined" ||
+      typeof process.cwd !== "function" ||
+      !fs ||
+      !path
+    ) {
+      logger.warn(
+        "saveDebugResponse: not running in Node environment, skipping file save"
+      );
+      // For browser, fallback to console.debug so developer can copy-paste
+      try {
+        console.debug(
+          "RAW_AI_RESPONSE",
+          prefix,
+          text.slice ? text.slice(0, 10000) : text
+        );
+      } catch (_e) {
+        /* ignore */
+      }
+      return null;
+    }
+
     // Persist raw response unconditionally when called (developer invoked on parse failure)
     const dir = path.join(process.cwd(), "debug", "failed_responses");
     fs.mkdirSync(dir, { recursive: true });
@@ -190,7 +559,11 @@ export const autocompleteCompanyInfo = async (
         "autocompleteCompanyInfo: JSON.parse failed, attempting safeParseJson",
         e
       );
-      filled = safeParseJson(response.text);
+      if (typeof response.text === "string") {
+        filled = safeParseJson(response.text);
+      } else {
+        filled = response.text;
+      }
       if (!filled) {
         const saved = saveDebugResponse(
           "autocompleteCompanyInfo",
@@ -340,7 +713,11 @@ export const generateCompanyHistory = async (
         "generateCompanyHistory: JSON.parse failed, attempting safeParseJson",
         e
       );
-      parsed = safeParseJson(response.text);
+      if (typeof response.text === "string") {
+        parsed = safeParseJson(response.text);
+      } else {
+        parsed = response.text;
+      }
       if (!parsed) {
         const saved = saveDebugResponse(
           "generateCompanyHistory",
@@ -690,7 +1067,16 @@ export const generateBulkDocuments = async (
   const results: GeneratedDocument[] = [];
 
   // Chunk history into groups to avoid token limits; configurable via VITE_CHUNK_YEARS
-  const CHUNK_YEARS = Number(process.env.VITE_CHUNK_YEARS) || 5;
+  // Read VITE_CHUNK_YEARS from Node env or Vite's import.meta.env, default to 10
+  const _envChunk =
+    typeof process !== "undefined" &&
+    process.env &&
+    process.env.VITE_CHUNK_YEARS
+      ? process.env.VITE_CHUNK_YEARS
+      : typeof import.meta !== "undefined"
+      ? (import.meta as any).env?.VITE_CHUNK_YEARS
+      : undefined;
+  const CHUNK_YEARS = Number(_envChunk ?? 10) || 10;
   const chunks = chunkArray(history, CHUNK_YEARS);
 
   // Define schemas per type
@@ -735,6 +1121,18 @@ Units: YEN. Use integers. Do not include extraneous text.`;
         const tPromptDone = nowMs();
         const promptBuildMs = Math.round(tPromptDone - tPromptStart);
 
+        // Emit the final assembled prompt to console for reproduction/inspection.
+        try {
+          console.log(
+            `AI PROMPT (generateBulkDocuments:JE) years=${chunk
+              .map((c) => c.year)
+              .join(",")} :`,
+            prompt
+          );
+        } catch (e) {
+          /* ignore logging failures */
+        }
+
         activityLogger.logEvent("api_request_sent", {
           caller: "generateBulkDocuments:JE",
           model: modelToUse,
@@ -748,6 +1146,24 @@ Units: YEN. Use integers. Do not include extraneous text.`;
           chunkSize: CHUNK_YEARS,
           ts: new Date().toISOString(),
         });
+        // Optionally persist the exact prompt used for offline repro/debugging
+        try {
+          if (
+            typeof process !== "undefined" &&
+            process.env &&
+            process.env.SAVE_PROMPT === "1"
+          ) {
+            saveDebugResponse(
+              `prompt_generateBulkDocuments:JE-${chunk
+                .map((c) => c.year)
+                .join("-")}`,
+              prompt
+            );
+          }
+        } catch (_p) {
+          /* ignore */
+        }
+
         const response = await (ai.models.generateContent as any)({
           model: modelToUse,
           contents: prompt,
@@ -775,17 +1191,51 @@ Units: YEN. Use integers. Do not include extraneous text.`;
         let parsed: any = null;
         try {
           parsed = safeParseJson(response.text);
-          // If parsed is an array of lines, try to normalize
-          if (
-            Array.isArray(parsed) &&
-            parsed.length > 0 &&
-            typeof parsed[0] === "string"
-          ) {
-            // Try parse first element as JSON array/object
-            const tryJoin = parsed.join("\n");
-            const reparsed = safeParseJson(tryJoin);
-            if (reparsed) parsed = reparsed;
+
+          // If model returned multiple JSON blocks (array of objects), merge them.
+          if (Array.isArray(parsed)) {
+            if (
+              parsed.length > 0 &&
+              parsed.every((p) => typeof p === "object" && p !== null)
+            ) {
+              const merged: any = {};
+              for (const part of parsed) {
+                for (const k of Object.keys(part)) {
+                  if (Array.isArray(merged[k]) && Array.isArray(part[k])) {
+                    merged[k] = merged[k].concat(part[k]);
+                  } else if (
+                    merged[k] &&
+                    typeof merged[k] === "object" &&
+                    part[k] &&
+                    typeof part[k] === "object"
+                  ) {
+                    merged[k] = { ...merged[k], ...part[k] };
+                  } else {
+                    merged[k] = part[k];
+                  }
+                }
+              }
+              parsed = merged;
+            } else if (parsed.length > 0 && typeof parsed[0] === "string") {
+              // join lines and try reparsing as object
+              const tryJoin = parsed.join("\n");
+              const reparsed = safeParseJson(tryJoin);
+              if (reparsed) parsed = reparsed;
+            }
           }
+
+          // Attempt coarse normalization for JE when the model returned primitive/fragmented arrays
+          try {
+            parsed = normalizeJE(
+              parsed,
+              response.text,
+              chunk.map((c) => c.year)
+            );
+          } catch (_err) {
+            /* non-fatal */
+          }
+
+          // If parsed is an object but some keys contain JSON strings, attempt to normalize further below.
 
           // If parsed.years contains string items, attempt to parse each
           if (
@@ -802,6 +1252,20 @@ Units: YEN. Use integers. Do not include extraneous text.`;
               } else normalizedYears.push(it);
             }
             parsed.years = normalizedYears;
+          }
+
+          // If parsed.years is an array of primitive numbers (e.g. [2020,2021,...]),
+          // convert them into objects so zod validation can succeed: { year: N, months: [] }
+          if (parsed && Array.isArray(parsed.years)) {
+            const isNumericYears = parsed.years.every(
+              (it: any) => typeof it === "number"
+            );
+            if (isNumericYears) {
+              parsed.years = parsed.years.map((y: number) => ({
+                year: y,
+                months: [],
+              }));
+            }
           }
 
           // Validate with zod
@@ -838,27 +1302,42 @@ Units: YEN. Use integers. Do not include extraneous text.`;
             });
           }
         } catch (e) {
+          // On parse/validation failure: save raw response and produce fallback docs
           logger.warn(
-            "Bulk JE parse/validation failed for chunk, falling back to per-year generation",
+            "Bulk JE parse/validation failed for chunk; saving raw response and producing fallback docs",
             e
           );
+          let saved: string | null = null;
+          try {
+            saved = saveDebugResponse(
+              `generateBulkDocuments:JE-${chunk.map((c) => c.year).join("-")}`,
+              response?.text || String(e)
+            );
+          } catch (_ee) {
+            /* ignore */
+          }
           activityLogger.logEvent("parse_error", {
             function: "generateBulkDocuments:JE",
             years: chunk.map((c) => c.year),
             error: String(e),
+            savedResponsePath: saved,
           });
-          // Fallback: per-year generateSingleDocument (which itself has fallback)
+
+          // Create placeholder/fallback GeneratedDocument per year in the chunk so batch continues
           for (const y of chunk) {
-            try {
-              const doc = await generateSingleDocument(
-                company,
-                y,
-                DocumentType.JE
-              );
-              results.push(doc);
-            } catch (err) {
-              logger.error("Fallback per-year JE failed", err);
-            }
+            results.push({
+              id: `${DocumentType.JE}-${y.year}`,
+              type: DocumentType.JE,
+              year: y.year,
+              title: `仕訳帳 ${y.year}年3月期 (PARSE_FAILED)`,
+              content: {
+                parsingFailed: true,
+                rawResponsePath: saved,
+                rawResponsePreview:
+                  (response?.text && String(response.text).slice(0, 4000)) ||
+                  String(e).slice(0, 4000),
+              },
+            });
           }
         }
       } catch (err) {
@@ -903,6 +1382,18 @@ Return structure: { "newsletters": [ { "year": 2020, "content": "..." } ] }`;
         const tPromptDone = nowMs();
         const promptBuildMs = Math.round(tPromptDone - tPromptStart);
 
+        // Emit the final assembled prompt to console for reproduction/inspection.
+        try {
+          console.log(
+            `AI PROMPT (generateBulkDocuments:NEWSLETTER) years=${chunk
+              .map((c) => c.year)
+              .join(",")} :`,
+            prompt
+          );
+        } catch (e) {
+          /* ignore logging failures */
+        }
+
         activityLogger.logEvent("api_request_sent", {
           caller: "generateBulkDocuments:NEWSLETTER",
           model: modelToUse,
@@ -916,6 +1407,24 @@ Return structure: { "newsletters": [ { "year": 2020, "content": "..." } ] }`;
           chunkSize: CHUNK_YEARS,
           ts: new Date().toISOString(),
         });
+        // Optionally persist the exact prompt used for offline repro/debugging
+        try {
+          if (
+            typeof process !== "undefined" &&
+            process.env &&
+            process.env.SAVE_PROMPT === "1"
+          ) {
+            saveDebugResponse(
+              `prompt_generateBulkDocuments:NEWSLETTER-${chunk
+                .map((c) => c.year)
+                .join("-")}`,
+              prompt
+            );
+          }
+        } catch (_p) {
+          /* ignore */
+        }
+
         const response = await (ai.models.generateContent as any)({
           model: modelToUse,
           contents: prompt,
@@ -941,26 +1450,72 @@ Return structure: { "newsletters": [ { "year": 2020, "content": "..." } ] }`;
           tokens: (response as any)?.usage?.totalTokens || null,
         });
         try {
-          let parsed: any = safeParseJson(response.text);
-          if (
-            Array.isArray(parsed) &&
-            parsed.length > 0 &&
-            typeof parsed[0] === "string"
-          ) {
-            const join = parsed.join("\n");
-            const reparsed = safeParseJson(join);
-            if (reparsed) parsed = reparsed;
+          let parsed: any = null;
+          if (typeof response.text === "string")
+            parsed = safeParseJson(response.text);
+          else parsed = response.text;
+
+          try {
+            let parsed: any = null;
+            if (typeof response.text === "string")
+              parsed = safeParseJson(response.text);
+            else parsed = response.text;
+
+            if (
+              Array.isArray(parsed) &&
+              parsed.length > 0 &&
+              typeof parsed[0] === "string"
+            ) {
+              const join = parsed.join("\n");
+              const reparsed = safeParseJson(join);
+              if (reparsed) parsed = reparsed;
+            }
+            parsed = normalizeNewsletters(
+              parsed,
+              response.text,
+              chunk.map((c) => c.year)
+            );
+          } catch (_err) {
+            /* non-fatal */
           }
-          // If newsletters items are strings, attempt parsing
+
+          // If newsletters is an array of primitives (numbers/strings), normalize into objects
+          // If response contains separate arrays like `years` and `entries`, synthesize `newsletters`
           if (
             parsed &&
-            Array.isArray(parsed.newsletters) &&
-            typeof parsed.newsletters[0] === "string"
+            !parsed.newsletters &&
+            Array.isArray(parsed.years) &&
+            Array.isArray(parsed.entries) &&
+            parsed.years.length === parsed.entries.length
           ) {
-            parsed.newsletters = parsed.newsletters.map(
-              (it: any) => safeParseJson(it) || it
-            );
+            parsed.newsletters = parsed.years.map((y: any, idx: number) => ({
+              year: Number(y) || (chunk[idx] ? chunk[idx].year : null),
+              content: String(parsed.entries[idx] || ""),
+            }));
           }
+
+          if (parsed && Array.isArray(parsed.newsletters)) {
+            const items = parsed.newsletters;
+            const isPrimitiveArray = items.every(
+              (it: any) => typeof it !== "object" || it === null
+            );
+            if (isPrimitiveArray) {
+              // Map by chunk order if lengths align, otherwise try to coerce by index
+              parsed.newsletters = items.map((it: any, idx: number) => {
+                const year = chunk[idx] ? chunk[idx].year : Number(it) || null;
+                return {
+                  year: typeof it === "number" && !isNaN(it) ? it : year,
+                  content: typeof it === "string" ? it : String(it || ""),
+                } as any;
+              });
+            } else {
+              // if items are strings that may contain JSON, try parsing each
+              parsed.newsletters = items.map(
+                (it: any) => safeParseJson(it) || it
+              );
+            }
+          }
+
           const validated = bulkNewsSchema.parse(parsed);
           for (const n of validated.newsletters) {
             results.push({
@@ -972,45 +1527,57 @@ Return structure: { "newsletters": [ { "year": 2020, "content": "..." } ] }`;
             });
           }
         } catch (e) {
+          // Don't auto-fallback to per-year generation here; save raw response for analysis
           logger.warn(
-            "Bulk NEWS parse/validation failed for chunk, falling back to per-year generation",
+            "Bulk NEWS parse/validation failed for chunk; saving raw response for analysis",
             e
           );
-          activityLogger.logEvent("parse_error", {
-            function: "generateBulkDocuments:NEWSLETTER",
-            years: chunk.map((c) => c.year),
-            error: String(e),
-          });
-          for (const y of chunk) {
-            try {
-              const doc = await generateSingleDocument(
-                company,
-                y,
-                DocumentType.NEWSLETTER
-              );
-              results.push(doc);
-            } catch (err) {
-              logger.error("Fallback per-year NEWS failed", err);
-            }
+          try {
+            const saved = saveDebugResponse(
+              `generateBulkDocuments:NEWSLETTER-${chunk
+                .map((c) => c.year)
+                .join("-")}`,
+              response?.text || String(e)
+            );
+            activityLogger.logEvent("parse_error", {
+              function: "generateBulkDocuments:NEWSLETTER",
+              years: chunk.map((c) => c.year),
+              error: String(e),
+              savedResponsePath: saved,
+            });
+          } catch (ee) {
+            activityLogger.logEvent("parse_error", {
+              function: "generateBulkDocuments:NEWSLETTER",
+              years: chunk.map((c) => c.year),
+              error: String(e),
+            });
           }
+          // skip this chunk (investigation mode)
         }
       } catch (err) {
-        logger.error(
-          "Bulk NEWS generation call failed, falling back to per-year",
-          err
-        );
-        for (const y of chunk) {
-          try {
-            const doc = await generateSingleDocument(
-              company,
-              y,
-              DocumentType.NEWSLETTER
-            );
-            results.push(doc);
-          } catch (e) {
-            logger.error("Fallback per-year NEWS failed", e);
-          }
+        // On API error, do not automatically fallback to per-year; save for analysis.
+        logger.error("Bulk NEWS generation call failed (no fallback):", err);
+        try {
+          const saved = saveDebugResponse(
+            `generateBulkDocuments:NEWSLETTER-err-${chunk
+              .map((c) => c.year)
+              .join("-")}`,
+            String(err)
+          );
+          activityLogger.logEvent("function_error", {
+            function: "generateBulkDocuments:NEWSLETTER",
+            years: chunk.map((c) => c.year),
+            error: String(err),
+            savedResponsePath: saved,
+          });
+        } catch (ee) {
+          activityLogger.logEvent("function_error", {
+            function: "generateBulkDocuments:NEWSLETTER",
+            years: chunk.map((c) => c.year),
+            error: String(err),
+          });
         }
+        // skip this chunk
       }
     }
   } else {
@@ -1063,6 +1630,14 @@ const generateSingleDocument = async (
     `;
     const tPromptDone = nowMs();
     const promptBuildMs = Math.round(tPromptDone - tPromptStart);
+    try {
+      console.log(
+        `AI PROMPT (generateSingleDocument:NEWSLETTER) year=${yearData.year}:`,
+        prompt
+      );
+    } catch (e) {
+      /* ignore */
+    }
     const apiRequestT0 = nowMs();
     const res = await ai.models.generateContent({
       model: "gemini-2.5-flash",
@@ -1104,6 +1679,14 @@ const generateSingleDocument = async (
       // prompt built above as `prompt`
       const tPromptDone = nowMs();
       const promptBuildMs = Math.round(tPromptDone - tPromptStart);
+      try {
+        console.log(
+          `AI PROMPT (generateSingleDocument:JE) year=${yearData.year}:`,
+          prompt
+        );
+      } catch (e) {
+        /* ignore */
+      }
       const apiRequestT0 = nowMs();
       const res = await ai.models.generateContent({
         model: "gemini-2.5-flash",
@@ -1128,7 +1711,8 @@ const generateSingleDocument = async (
           `JE: AI returned non-JSON for ${yearData.year}, attempting safeParseJson`,
           e
         );
-        parsed = safeParseJson(res.text);
+        if (typeof res.text === "string") parsed = safeParseJson(res.text);
+        else parsed = res.text;
         if (!parsed) {
           const saved = saveDebugResponse(
             `JE-${yearData.year}`,
