@@ -2,6 +2,7 @@ import jsPDF from "jspdf";
 import JSZip from "jszip";
 import html2canvas from "html2canvas";
 import { GeneratedDocument } from "../types";
+import { logger } from "./logger";
 
 /**
  * Generate a ZIP file containing PDFs.
@@ -13,17 +14,34 @@ import { GeneratedDocument } from "../types";
  */
 export const generateZipPackage = async (
   documents: GeneratedDocument[],
-  elementIds: Record<string, string>
+  elementIds: Record<string, string>,
+  onProgress?: (info: {
+    index: number;
+    total: number;
+    docId: string;
+    stage: string;
+  }) => void
 ): Promise<Blob> => {
   const zip = new JSZip();
+  const total = documents.length;
 
-  for (const doc of documents) {
+  for (let i = 0; i < documents.length; i++) {
+    const doc = documents[i];
     const elementId = elementIds[doc.id];
     const element = document.getElementById(elementId);
+    onProgress?.({ index: i + 1, total, docId: doc.id, stage: "start" });
 
     if (element) {
       try {
-        const pdfBlob = await createPdfFromElement(element, doc.title);
+        logger.debug("Creating PDF for", doc.id, elementId);
+        const pdfBlob = await createPdfFromElement(element, doc.title, (p) =>
+          onProgress?.({
+            index: i + 1,
+            total,
+            docId: doc.id,
+            stage: `render:${p}`,
+          })
+        );
 
         let folderName = "Other";
         if (["BS", "PL", "CF", "GL", "JE"].includes(doc.type))
@@ -34,28 +52,43 @@ export const generateZipPackage = async (
         const safeTitle = doc.title.replace(/[\s\/]/g, "_");
         const fileName = `${safeTitle}_${doc.year || doc.id}.pdf`;
         zip.folder(folderName)?.file(fileName, pdfBlob);
+        onProgress?.({ index: i + 1, total, docId: doc.id, stage: "done" });
       } catch (e) {
-        console.error(`Failed to generate PDF for ${doc.id}`, e);
+        logger.error(`Failed to generate PDF for ${doc.id}`, e);
+        onProgress?.({ index: i + 1, total, docId: doc.id, stage: "error" });
       }
+    } else {
+      logger.warn("Element not found for PDF generation", elementId, doc.id);
+      onProgress?.({
+        index: i + 1,
+        total,
+        docId: doc.id,
+        stage: "missing-element",
+      });
     }
   }
 
+  onProgress?.({ index: total, total, docId: "all", stage: "zipping" });
   return await zip.generateAsync({ type: "blob" });
 };
 
 const createPdfFromElement = async (
   element: HTMLElement,
-  title: string
+  title: string,
+  onRenderProgress?: (step: string) => void
 ): Promise<Blob> => {
   // 1. Capture the element as a canvas
   // scale: 2 improves resolution for text
+  onRenderProgress?.("start-capture");
   const canvas = await html2canvas(element, {
     scale: 2,
     useCORS: true,
     logging: false,
   });
+  onRenderProgress?.("captured");
 
   const imgData = canvas.toDataURL("image/png");
+  onRenderProgress?.("to-dataurl");
 
   // 2. Create PDF (A4 size)
   const pdf = new jsPDF("p", "mm", "a4");
@@ -82,5 +115,6 @@ const createPdfFromElement = async (
     heightLeft -= pdfHeight;
   }
 
+  onRenderProgress?.("pdf-ready");
   return pdf.output("blob");
 };

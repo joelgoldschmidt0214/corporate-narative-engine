@@ -1,28 +1,42 @@
-import React, { useState } from 'react';
-import { AppStep, CompanyInput, YearlyData } from './types';
-import { generateCompanyHistory } from './services/geminiService';
-import InputSection from './components/InputSection';
-import HistoryEditor from './components/HistoryEditor';
-import DocumentGenerator from './components/DocumentGenerator';
-import { Layout, Briefcase, ChevronRight } from 'lucide-react';
+import React, { useState, useRef, useEffect } from "react";
+import { AppStep, CompanyInput, YearlyData } from "./types";
+import { generateCompanyHistory } from "./services/geminiService";
+import InputSection, { InputSectionHandle } from "./components/InputSection";
+import HistoryEditor from "./components/HistoryEditor";
+import DocumentGenerator from "./components/DocumentGenerator";
+import { Layout, Briefcase, ChevronRight, Loader2 } from "lucide-react";
 
 const App: React.FC = () => {
   const [step, setStep] = useState<AppStep>(AppStep.INPUT_DETAILS);
   const [companyData, setCompanyData] = useState<CompanyInput | null>(null);
   const [historyData, setHistoryData] = useState<YearlyData[]>([]);
   const [isLoading, setIsLoading] = useState(false);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [isAutoFilling, setIsAutoFilling] = useState(false);
+  const [autoFillSeconds, setAutoFillSeconds] = useState(0);
+  const inputRef = useRef<InputSectionHandle | null>(null);
 
   const handleGenerateHistory = async (input: CompanyInput) => {
     setIsLoading(true);
+    setElapsedSeconds(0);
     setCompanyData(input);
     try {
+      const start = Date.now();
+      const timer = setInterval(
+        () => setElapsedSeconds(Math.floor((Date.now() - start) / 1000)),
+        1000
+      );
       const data = await generateCompanyHistory(input);
+      clearInterval(timer);
       setHistoryData(data);
       setStep(AppStep.REVIEW_HISTORY);
     } catch (error) {
-      alert("履歴の生成に失敗しました。APIキーを確認するか、もう一度お試しください。");
+      alert(
+        "履歴の生成に失敗しました。APIキーを確認するか、もう一度お試しください。"
+      );
     } finally {
       setIsLoading(false);
+      setElapsedSeconds(0);
     }
   };
 
@@ -30,17 +44,23 @@ const App: React.FC = () => {
     switch (step) {
       case AppStep.INPUT_DETAILS:
         return (
-           <InputSection 
-             initialData={companyData}
-             onGenerate={handleGenerateHistory} 
-             isLoading={isLoading} 
-           />
+          <InputSection
+            ref={inputRef}
+            initialData={companyData}
+            onGenerate={handleGenerateHistory}
+            isLoading={isLoading}
+            showHeaderControls={true}
+            onAutoFillStatus={(running, seconds) => {
+              setIsAutoFilling(running);
+              setAutoFillSeconds(seconds ?? 0);
+            }}
+          />
         );
       case AppStep.REVIEW_HISTORY:
         return (
-          <HistoryEditor 
-            data={historyData} 
-            onUpdate={setHistoryData} 
+          <HistoryEditor
+            data={historyData}
+            onUpdate={setHistoryData}
             onProceed={() => setStep(AppStep.SELECT_DOCS)}
             onBack={() => setStep(AppStep.INPUT_DETAILS)}
           />
@@ -48,10 +68,10 @@ const App: React.FC = () => {
       case AppStep.SELECT_DOCS:
       case AppStep.PREVIEW_DOCS:
         return (
-          <DocumentGenerator 
-            company={companyData} 
-            history={historyData} 
-            onBack={() => setStep(AppStep.REVIEW_HISTORY)} 
+          <DocumentGenerator
+            company={companyData}
+            history={historyData}
+            onBack={() => setStep(AppStep.REVIEW_HISTORY)}
           />
         );
       default:
@@ -71,16 +91,86 @@ const App: React.FC = () => {
               Corporate Narrative Engine
             </h1>
           </div>
-          
+
           <nav className="hidden md:flex items-center gap-2 text-sm text-slate-500">
-            <span className={step === AppStep.INPUT_DETAILS ? 'text-blue-600 font-bold' : ''}>1. 会社情報</span>
+            <span
+              className={
+                step === AppStep.INPUT_DETAILS ? "text-blue-600 font-bold" : ""
+              }
+            >
+              1. 会社情報
+            </span>
             <ChevronRight className="w-4 h-4" />
-            <span className={step === AppStep.REVIEW_HISTORY ? 'text-blue-600 font-bold' : ''}>2. 履歴編集</span>
+            <span
+              className={
+                step === AppStep.REVIEW_HISTORY ? "text-blue-600 font-bold" : ""
+              }
+            >
+              2. 履歴編集
+            </span>
             <ChevronRight className="w-4 h-4" />
-            <span className={step === AppStep.SELECT_DOCS || step === AppStep.PREVIEW_DOCS ? 'text-blue-600 font-bold' : ''}>3. ドキュメント生成</span>
+            <span
+              className={
+                step === AppStep.SELECT_DOCS || step === AppStep.PREVIEW_DOCS
+                  ? "text-blue-600 font-bold"
+                  : ""
+              }
+            >
+              3. ドキュメント生成
+            </span>
           </nav>
+          {/* header has no action buttons; actions live in toolbar under header */}
         </div>
       </header>
+
+      {/* Non-scrolling toolbar directly under header (visible on input step) */}
+      {step === AppStep.INPUT_DETAILS && (
+        <div className="sticky top-16 z-40 bg-white border-b border-slate-200">
+          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3 flex items-center justify-end gap-3">
+            <button
+              onClick={async () => {
+                try {
+                  await inputRef.current?.autoFill();
+                } catch (e) {
+                  console.error(e);
+                }
+              }}
+              disabled={isAutoFilling}
+              className="flex items-center gap-2 px-3 py-2 bg-purple-100 text-purple-700 rounded-md text-sm font-bold"
+            >
+              {isAutoFilling ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : null}
+              <span>
+                AIで補完{isAutoFilling ? ` (${autoFillSeconds}s)` : ""}
+              </span>
+            </button>
+
+            <button
+              onClick={async () => {
+                try {
+                  inputRef.current?.submit();
+                } catch (e) {
+                  console.error(e);
+                }
+              }}
+              disabled={isLoading}
+              className={`flex items-center gap-2 px-4 py-2 rounded-md text-sm font-bold ${
+                isLoading ? "bg-slate-400 text-white" : "bg-blue-600 text-white"
+              }`}
+            >
+              {isLoading ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  <span>生成中… ({elapsedSeconds}s)</span>
+                </>
+              ) : (
+                "会社情報を生成"
+              )}
+            </button>
+          </div>
+        </div>
+      )}
 
       <main className="flex-grow max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 w-full">
         {renderStep()}
@@ -92,7 +182,10 @@ const App: React.FC = () => {
             <Briefcase className="w-4 h-4" />
             <span>Built for Enterprise Sales Enablement</span>
           </div>
-          <p>© {new Date().getFullYear()} Corporate Narrative Engine. Powered by Google Gemini.</p>
+          <p>
+            © {new Date().getFullYear()} Corporate Narrative Engine. Powered by
+            Google Gemini.
+          </p>
         </div>
       </footer>
     </div>

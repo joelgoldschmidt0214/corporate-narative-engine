@@ -9,6 +9,9 @@ import {
   DetailedFinancials,
   FinancialSection,
 } from "../types";
+import { logger } from "./logger";
+import * as fs from "fs";
+import * as path from "path";
 
 const getClient = () => {
   const apiKey = process.env.API_KEY;
@@ -26,6 +29,73 @@ const chunkArray = <T>(arr: T[], size: number): T[][] => {
   const out: T[][] = [];
   for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
   return out;
+};
+
+// Robust JSON parsing helper: try direct parse, then try extracting first/last brace, then try linewise parsing.
+const safeParseJson = (text: string): any => {
+  if (!text) return null;
+  try {
+    return JSON.parse(text.trim());
+  } catch (e) {
+    // Try to extract JSON object/array substring
+    const first = text.indexOf("{");
+    const last = text.lastIndexOf("}");
+    if (first !== -1 && last !== -1 && last > first) {
+      const sub = text.slice(first, last + 1);
+      try {
+        return JSON.parse(sub);
+      } catch (e2) {
+        // continue
+      }
+    }
+    // Try to find a JSON array
+    const arrFirst = text.indexOf("[");
+    const arrLast = text.lastIndexOf("]");
+    if (arrFirst !== -1 && arrLast !== -1 && arrLast > arrFirst) {
+      const sub = text.slice(arrFirst, arrLast + 1);
+      try {
+        return JSON.parse(sub);
+      } catch (e3) {
+        // continue
+      }
+    }
+    // As last resort, try parsing line by line to build an array/object
+    const lines = text
+      .split(/\n+/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+    // If each line looks like JSON, try parsing them
+    const parsedLines = [] as any[];
+    for (const l of lines) {
+      try {
+        parsedLines.push(JSON.parse(l));
+      } catch (_) {
+        // try plain string
+        parsedLines.push(l);
+      }
+    }
+    if (parsedLines.length > 0) return parsedLines;
+    return null;
+  }
+};
+
+const saveDebugResponse = (prefix: string, text: string) => {
+  try {
+    // Persist raw response unconditionally when called (developer invoked on parse failure)
+    const dir = path.join(process.cwd(), "debug", "failed_responses");
+    fs.mkdirSync(dir, { recursive: true });
+    const filename = `${prefix.replace(
+      /[^a-z0-9_-]/gi,
+      "_"
+    )}-${Date.now()}.txt`;
+    const filePath = path.join(dir, filename);
+    fs.writeFileSync(filePath, text, { encoding: "utf-8" });
+    logger.info("Saved raw AI response for debugging", filePath);
+    return filePath;
+  } catch (e) {
+    logger.error("Failed to save debug response", e);
+    return null;
+  }
 };
 
 const DOC_TYPE_LABELS: Record<DocumentType, string> = {
@@ -78,7 +148,27 @@ export const autocompleteCompanyInfo = async (
       config: { responseMimeType: "application/json" },
     });
 
-    const filled = JSON.parse(response.text.trim());
+    let filled: any = null;
+    try {
+      filled = JSON.parse(response.text.trim());
+    } catch (e) {
+      logger.warn(
+        "autocompleteCompanyInfo: JSON.parse failed, attempting safeParseJson",
+        e
+      );
+      filled = safeParseJson(response.text);
+      if (!filled) {
+        const saved = saveDebugResponse(
+          "autocompleteCompanyInfo",
+          response.text || ""
+        );
+        throw new Error(
+          `Failed to parse autocomplete response as JSON. Raw response saved: ${
+            saved || "(not saved)"
+          }`
+        );
+      }
+    }
     return {
       name: currentInput.name || filled.name,
       industry: currentInput.industry || filled.industry,
@@ -97,7 +187,7 @@ export const autocompleteCompanyInfo = async (
           : filled.ceoHistory,
     };
   } catch (e) {
-    console.error("Autocomplete failed", e);
+    logger.error("Autocomplete failed", e);
     return currentInput;
   }
 };
@@ -107,6 +197,12 @@ export const generateCompanyHistory = async (
   input: CompanyInput
 ): Promise<YearlyData[]> => {
   const ai = getClient();
+  logger.info(
+    "Starting generateCompanyHistory",
+    input.name,
+    input.foundedYear,
+    input.currentYear
+  );
   const endYear = Number(input.currentYear) || new Date().getFullYear();
   const startYear = Number(input.foundedYear);
 
@@ -167,7 +263,32 @@ export const generateCompanyHistory = async (
       contents: prompt,
       config: { responseMimeType: "application/json" },
     });
-    const parsed: YearlyData[] = JSON.parse(response.text.trim());
+
+    let parsed: any = null;
+    try {
+      parsed = JSON.parse(response.text.trim());
+    } catch (e) {
+      logger.warn(
+        "generateCompanyHistory: JSON.parse failed, attempting safeParseJson",
+        e
+      );
+      parsed = safeParseJson(response.text);
+      if (!parsed) {
+        const saved = saveDebugResponse(
+          "generateCompanyHistory",
+          response.text || ""
+        );
+        logger.error(
+          "generateCompanyHistory: failed to parse AI response as JSON",
+          { saved }
+        );
+        throw new Error(
+          `Failed to parse generateCompanyHistory response as JSON. Raw response saved: ${
+            saved || "(not saved)"
+          }`
+        );
+      }
+    }
 
     // Validate & normalize each year's detailed financials so downstream
     // local generation (BS/PL/CF) can rely on consistent numbers.
@@ -288,12 +409,19 @@ export const generateCompanyHistory = async (
       f.investingCF = toNum(f.investingCF);
       f.financingCF = toNum(f.financingCF);
 
+      logger.debug("Normalized year financials", y.year, f);
       return { ...y, financials: f };
     };
 
+    logger.info(
+      "Generated company history",
+      input.name,
+      parsed.length,
+      "years"
+    );
     return parsed.map(normalizeYear);
   } catch (error) {
-    console.error("Error generating history:", error);
+    logger.error("Error generating history:", error);
     throw error;
   }
 };
@@ -489,8 +617,9 @@ export const generateBulkDocuments = async (
   const ai = getClient();
   const results: GeneratedDocument[] = [];
 
-  // Chunk history into 5-year groups to avoid token limits
-  const chunks = chunkArray(history, 5);
+  // Chunk history into groups to avoid token limits; configurable via VITE_CHUNK_YEARS
+  const CHUNK_YEARS = Number(process.env.VITE_CHUNK_YEARS) || 5;
+  const chunks = chunkArray(history, CHUNK_YEARS);
 
   // Define schemas per type
   if (type === DocumentType.JE) {
@@ -528,6 +657,13 @@ Units: YEN. Use integers. Do not include extraneous text.`;
 
       try {
         const modelToUse = preferredModel || "gemini-2.5-flash-lite";
+        logger.info("Bulk JE request start", {
+          model: modelToUse,
+          years: chunk.map((c) => c.year),
+          chunkSize: CHUNK_YEARS,
+          ts: new Date().toISOString(),
+        });
+        const t0 = Date.now();
         const response = await (ai.models.generateContent as any)({
           model: modelToUse,
           contents: prompt,
@@ -536,10 +672,45 @@ Units: YEN. Use integers. Do not include extraneous text.`;
             responseJsonSchema: zodToJsonSchema(bulkSchema as any),
           },
         } as any);
-
+        const duration = Date.now() - t0;
+        logger.info("Bulk JE request end", {
+          years: chunk.map((c) => c.year),
+          durationMs: duration,
+          respLength: response.text?.length || 0,
+        });
+        logger.debug("Bulk JE response length", response.text?.length || 0);
         let parsed: any = null;
         try {
-          parsed = JSON.parse(response.text.trim());
+          parsed = safeParseJson(response.text);
+          // If parsed is an array of lines, try to normalize
+          if (
+            Array.isArray(parsed) &&
+            parsed.length > 0 &&
+            typeof parsed[0] === "string"
+          ) {
+            // Try parse first element as JSON array/object
+            const tryJoin = parsed.join("\n");
+            const reparsed = safeParseJson(tryJoin);
+            if (reparsed) parsed = reparsed;
+          }
+
+          // If parsed.years contains string items, attempt to parse each
+          if (
+            parsed &&
+            Array.isArray(parsed.years) &&
+            parsed.years.length > 0 &&
+            typeof parsed.years[0] === "string"
+          ) {
+            const normalizedYears: any[] = [];
+            for (const it of parsed.years) {
+              if (typeof it === "string") {
+                const p = safeParseJson(it);
+                normalizedYears.push(p || it);
+              } else normalizedYears.push(it);
+            }
+            parsed.years = normalizedYears;
+          }
+
           // Validate with zod
           const validated = bulkSchema.parse(parsed);
 
@@ -574,7 +745,7 @@ Units: YEN. Use integers. Do not include extraneous text.`;
             });
           }
         } catch (e) {
-          console.warn(
+          logger.warn(
             "Bulk JE parse/validation failed for chunk, falling back to per-year generation",
             e
           );
@@ -588,12 +759,12 @@ Units: YEN. Use integers. Do not include extraneous text.`;
               );
               results.push(doc);
             } catch (err) {
-              console.error("Fallback per-year JE failed", err);
+              logger.error("Fallback per-year JE failed", err);
             }
           }
         }
       } catch (err) {
-        console.error(
+        logger.error(
           "Bulk JE generation call failed, falling back to per-year",
           err
         );
@@ -606,7 +777,7 @@ Units: YEN. Use integers. Do not include extraneous text.`;
             );
             results.push(doc);
           } catch (e) {
-            console.error("Fallback per-year JE failed", e);
+            logger.error("Fallback per-year JE failed", e);
           }
         }
       }
@@ -629,6 +800,13 @@ Return structure: { "newsletters": [ { "year": 2020, "content": "..." } ] }`;
 
       try {
         const modelToUse = preferredModel || "gemini-2.5-flash";
+        logger.info("Bulk NEWS request start", {
+          model: modelToUse,
+          years: chunk.map((c) => c.year),
+          chunkSize: CHUNK_YEARS,
+          ts: new Date().toISOString(),
+        });
+        const t0 = Date.now();
         const response = await (ai.models.generateContent as any)({
           model: modelToUse,
           contents: prompt,
@@ -637,9 +815,34 @@ Return structure: { "newsletters": [ { "year": 2020, "content": "..." } ] }`;
             responseJsonSchema: zodToJsonSchema(bulkNewsSchema as any),
           },
         } as any);
-
+        const duration = Date.now() - t0;
+        logger.info("Bulk NEWS request end", {
+          years: chunk.map((c) => c.year),
+          durationMs: duration,
+          respLength: response.text?.length || 0,
+        });
+        logger.debug("Bulk NEWS response length", response.text?.length || 0);
         try {
-          const parsed = JSON.parse(response.text.trim());
+          let parsed: any = safeParseJson(response.text);
+          if (
+            Array.isArray(parsed) &&
+            parsed.length > 0 &&
+            typeof parsed[0] === "string"
+          ) {
+            const join = parsed.join("\n");
+            const reparsed = safeParseJson(join);
+            if (reparsed) parsed = reparsed;
+          }
+          // If newsletters items are strings, attempt parsing
+          if (
+            parsed &&
+            Array.isArray(parsed.newsletters) &&
+            typeof parsed.newsletters[0] === "string"
+          ) {
+            parsed.newsletters = parsed.newsletters.map(
+              (it: any) => safeParseJson(it) || it
+            );
+          }
           const validated = bulkNewsSchema.parse(parsed);
           for (const n of validated.newsletters) {
             results.push({
@@ -651,7 +854,7 @@ Return structure: { "newsletters": [ { "year": 2020, "content": "..." } ] }`;
             });
           }
         } catch (e) {
-          console.warn(
+          logger.warn(
             "Bulk NEWS parse/validation failed for chunk, falling back to per-year generation",
             e
           );
@@ -664,12 +867,12 @@ Return structure: { "newsletters": [ { "year": 2020, "content": "..." } ] }`;
               );
               results.push(doc);
             } catch (err) {
-              console.error("Fallback per-year NEWS failed", err);
+              logger.error("Fallback per-year NEWS failed", err);
             }
           }
         }
       } catch (err) {
-        console.error(
+        logger.error(
           "Bulk NEWS generation call failed, falling back to per-year",
           err
         );
@@ -682,7 +885,7 @@ Return structure: { "newsletters": [ { "year": 2020, "content": "..." } ] }`;
             );
             results.push(doc);
           } catch (e) {
-            console.error("Fallback per-year NEWS failed", e);
+            logger.error("Fallback per-year NEWS failed", e);
           }
         }
       }
@@ -694,7 +897,7 @@ Return structure: { "newsletters": [ { "year": 2020, "content": "..." } ] }`;
         const doc = await generateSingleDocument(company, y, type);
         results.push(doc);
       } catch (e) {
-        console.error("Per-year generation failed for type", type, e);
+        logger.error("Per-year generation failed for type", type, e);
       }
     }
   }
@@ -771,10 +974,21 @@ const generateSingleDocument = async (
       try {
         parsed = JSON.parse(res.text.trim());
       } catch (e) {
-        console.warn(
-          `JE: AI returned non-JSON for ${yearData.year}, falling back`,
+        logger.warn(
+          `JE: AI returned non-JSON for ${yearData.year}, attempting safeParseJson`,
           e
         );
+        parsed = safeParseJson(res.text);
+        if (!parsed) {
+          const saved = saveDebugResponse(
+            `JE-${yearData.year}`,
+            res.text || ""
+          );
+          logger.error(
+            "JE: failed to parse AI response and safeParseJson returned null",
+            { saved }
+          );
+        }
       }
 
       const hasSections =
@@ -850,7 +1064,7 @@ const generateSingleDocument = async (
         content: parsed,
       };
     } catch (e) {
-      console.error("JE generation failed, falling back to synthesized JE", e);
+      logger.error("JE generation failed, falling back to synthesized JE", e);
       const months = [] as any[];
       const monthNamesJP = [
         "4月",
@@ -949,7 +1163,7 @@ export const batchGenerateDocuments = async (
       results.push(...docs);
       completedCount += docs.length;
     } catch (e) {
-      console.error("Bulk generation failed for", t, e);
+      logger.error("Bulk generationFailed for", t, e);
       // As a final fallback, attempt per-year serial generation
       for (const h of history) {
         onProgress(completedCount, `${DOC_TYPE_LABELS[t]} (${h.year})`);
@@ -957,10 +1171,11 @@ export const batchGenerateDocuments = async (
           const doc = await generateSingleDocument(company, h, t);
           results.push(doc);
         } catch (err) {
-          console.error(err);
+          logger.error(err);
         }
         completedCount++;
-        await delay(2000);
+        // keep a small pause to avoid accidental rate limits, reduced from 2s to 0.2s
+        await delay(200);
       }
     }
   }

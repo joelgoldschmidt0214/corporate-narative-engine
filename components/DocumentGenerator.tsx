@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 import { batchGenerateDocuments } from "../services/geminiService";
 import { generateZipPackage } from "../services/pdfService";
+import { logger } from "../services/logger";
 import ReactMarkdown from "react-markdown";
 
 interface Props {
@@ -44,6 +45,7 @@ const DocumentGenerator: React.FC<Props> = ({ company, history, onBack }) => {
   const [endYear, setEndYear] = useState(history[history.length - 1].year);
 
   const [isGenerating, setIsGenerating] = useState(false);
+  const [generateSeconds, setGenerateSeconds] = useState(0);
   const [progress, setProgress] = useState({ currentDoc: "" });
   const [generatedDocs, setGeneratedDocs] = useState<GeneratedDocument[]>([]);
 
@@ -61,25 +63,42 @@ const DocumentGenerator: React.FC<Props> = ({ company, history, onBack }) => {
 
   const handleGenerate = async () => {
     setIsGenerating(true);
+    setGenerateSeconds(0);
     setGeneratedDocs([]);
     const targetHistory = history.filter(
       (h) => h.year >= startYear && h.year <= endYear
     );
 
     try {
+      logger.info("Starting document batch generation", {
+        company: company?.name,
+        years: `${startYear}-${endYear}`,
+        types: selectedTypes,
+      });
+      const start = Date.now();
+      const timer = setInterval(
+        () => setGenerateSeconds(Math.floor((Date.now() - start) / 1000)),
+        1000
+      );
+
       const docs = await batchGenerateDocuments(
         company,
         targetHistory,
         selectedTypes,
-        (_, currentDoc) => {
+        (completed, currentDoc) => {
           setProgress({ currentDoc });
+          logger.info("Generation progress", completed, currentDoc);
         }
       );
+      clearInterval(timer);
+      logger.info("Batch generation completed", { count: docs.length });
       setGeneratedDocs(docs);
     } catch (e) {
+      logger.error("Generation failed", e);
       alert("生成エラー");
     } finally {
       setIsGenerating(false);
+      setGenerateSeconds(0);
     }
   };
 
@@ -98,7 +117,11 @@ const DocumentGenerator: React.FC<Props> = ({ company, history, onBack }) => {
 
     try {
       setDownloadProgress("圧縮中...");
-      const blob = await generateZipPackage(docsSubset, elementIds);
+      const blob = await generateZipPackage(docsSubset, elementIds, (info) => {
+        setDownloadProgress(
+          `(${info.index}/${info.total}) ${info.docId} - ${info.stage}`
+        );
+      });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
@@ -108,6 +131,7 @@ const DocumentGenerator: React.FC<Props> = ({ company, history, onBack }) => {
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
     } catch (e) {
+      logger.error("Download failed", e);
       alert("ダウンロード失敗");
     } finally {
       setIsDownloading(false);
@@ -144,15 +168,16 @@ const DocumentGenerator: React.FC<Props> = ({ company, history, onBack }) => {
     const yearsCount = endYear - startYear + 1;
     const totalDocs = yearsCount * selectedTypes.length;
 
-    // Estimation logic:
+    // Estimation logic (chunk-aware):
     // Financials (BS/PL/CF) are generated locally (instant, 0s).
-    // Heavy docs (JE, Newsletter) are 1 call per year (3s per call).
-
+    // Heavy docs (JE, Newsletter) are requested in chunks; use Vite env VITE_CHUNK_YEARS.
     const heavyTypes = selectedTypes.filter(
       (t) => ![DocumentType.BS, DocumentType.PL, DocumentType.CF].includes(t)
     );
-    const heavyCalls = yearsCount * heavyTypes.length;
-    const estimatedSeconds = heavyCalls * 3;
+    const CHUNK_YEARS = Number(process.env.VITE_CHUNK_YEARS) || 5;
+    const heavyCalls = Math.ceil(yearsCount / CHUNK_YEARS) * heavyTypes.length;
+    const AI_ESTIMATE_SECONDS = 120; // conservative per-AI-request estimate (seconds)
+    const estimatedSeconds = heavyCalls * AI_ESTIMATE_SECONDS;
 
     return { totalDocs, estimatedSeconds };
   }, [startYear, endYear, selectedTypes]);
@@ -412,7 +437,15 @@ const DocumentGenerator: React.FC<Props> = ({ company, history, onBack }) => {
             戻る
           </button>
         )}
-        <div className="flex gap-2">{downloadButtons}</div>
+        <div className="flex gap-2 items-center">
+          {downloadButtons}
+          {isDownloading && (
+            <div className="flex items-center gap-2 text-sm text-slate-600">
+              <Loader2 className="w-4 h-4 animate-spin" />
+              <span>{downloadProgress || "処理中..."}</span>
+            </div>
+          )}
+        </div>
         {generatedDocs.length === 0 && (
           <button
             onClick={handleGenerate}
@@ -568,9 +601,11 @@ const DocumentGenerator: React.FC<Props> = ({ company, history, onBack }) => {
           <table className="w-full text-sm border-collapse">
             <thead>
               <tr>
-                <th className="p-3 border-b bg-slate-50 w-24">年度</th>
+                <th className="p-3 border-b bg-slate-50 w-24 text-center">
+                  年度
+                </th>
                 {selectedTypes.map((t) => (
-                  <th key={t} className="p-3 border-b bg-slate-50">
+                  <th key={t} className="p-3 border-b bg-slate-50 text-center">
                     {DOC_TYPE_LABELS[t]}
                   </th>
                 ))}
@@ -581,13 +616,13 @@ const DocumentGenerator: React.FC<Props> = ({ company, history, onBack }) => {
                 .sort((a, b) => Number(a) - Number(b))
                 .map((y) => (
                   <tr key={y} className="hover:bg-slate-50">
-                    <td className="p-3 border-b font-bold">{y}</td>
+                    <td className="p-3 border-b font-bold text-center">{y}</td>
                     {selectedTypes.map((t) => {
                       const doc = generatedDocs.find(
                         (d) => d.year === y && d.type === t
                       );
                       return (
-                        <td key={t} className="p-3 border-b">
+                        <td key={t} className="p-3 border-b text-center">
                           {doc ? (
                             <button
                               onClick={() => openEditModal(doc)}
