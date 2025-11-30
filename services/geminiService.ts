@@ -1,4 +1,6 @@
 import { GoogleGenAI } from "@google/genai";
+import { z } from "zod";
+import { zodToJsonSchema } from "zod-to-json-schema";
 import {
   CompanyInput,
   YearlyData,
@@ -18,6 +20,13 @@ const getClient = () => {
 
 // Helper for delay
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Utility: chunk an array into n-sized groups
+const chunkArray = <T>(arr: T[], size: number): T[][] => {
+  const out: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+};
 
 const DOC_TYPE_LABELS: Record<DocumentType, string> = {
   [DocumentType.BS]: "貸借対照表",
@@ -470,6 +479,229 @@ export const generateLocalFinancialDocuments = (
   };
 };
 
+// --- Bulk Generation (chunked, structured output) ---
+export const generateBulkDocuments = async (
+  company: CompanyInput,
+  history: YearlyData[],
+  type: DocumentType,
+  preferredModel?: string
+): Promise<GeneratedDocument[]> => {
+  const ai = getClient();
+  const results: GeneratedDocument[] = [];
+
+  // Chunk history into 5-year groups to avoid token limits
+  const chunks = chunkArray(history, 5);
+
+  // Define schemas per type
+  if (type === DocumentType.JE) {
+    const itemSchema: z.ZodType<any> = z.object({
+      date: z.string(),
+      account: z.string(),
+      debit: z.number().optional(),
+      credit: z.number().optional(),
+      label: z.string().optional(),
+    });
+    const monthSchema: z.ZodType<any> = z.object({
+      title: z.string(),
+      breakPage: z.boolean().optional(),
+      headers: z.array(z.string()).optional(),
+      items: z.array(itemSchema),
+    });
+    const yearSchema: z.ZodType<any> = z.object({
+      year: z.number(),
+      months: z.array(monthSchema),
+    });
+    const bulkSchema: z.ZodType<any> = z.object({ years: z.array(yearSchema) });
+
+    for (const chunk of chunks) {
+      // Build prompt with per-year context (compact)
+      const yearsContext = chunk
+        .map(
+          (y) =>
+            `Year:${y.year} Rev:${y.revenue}M Profit:${y.operatingProfit}M Event:${y.companyEvent}`
+        )
+        .join("\n");
+
+      const prompt = `Company: ${company.name}\nProvide monthly summary journal entries for the following years (Apr-Mar).\nRespond ONLY with JSON matching the provided schema.\nYears:\n${yearsContext}\n
+Return structure: { "years": [ { "year": 2020, "months": [ { "title": "4月", "items": [{ "date":"4/30","account":"売掛金","debit":100000,"credit":0,"label":"..." }] } ] } ] }\n
+Units: YEN. Use integers. Do not include extraneous text.`;
+
+      try {
+        const modelToUse = preferredModel || "gemini-2.5-flash-lite";
+        const response = await (ai.models.generateContent as any)({
+          model: modelToUse,
+          contents: prompt,
+          config: {
+            responseMimeType: "application/json",
+            responseJsonSchema: zodToJsonSchema(bulkSchema as any),
+          },
+        } as any);
+
+        let parsed: any = null;
+        try {
+          parsed = JSON.parse(response.text.trim());
+          // Validate with zod
+          const validated = bulkSchema.parse(parsed);
+
+          for (const y of validated.years) {
+            // Map months -> sections for GeneratedDocument
+            const sections = y.months.map((m: any) => ({
+              title: m.title,
+              breakPage: m.breakPage || false,
+              headers: m.headers || [
+                "日付",
+                "借方",
+                "金額",
+                "貸方",
+                "金額",
+                "摘要",
+              ],
+              items: m.items.map((it: any) => ({
+                date: it.date,
+                account: it.account,
+                debit: it.debit ?? 0,
+                credit: it.credit ?? 0,
+                label: it.label || "",
+              })),
+            }));
+
+            results.push({
+              id: `${DocumentType.JE}-${y.year}`,
+              type: DocumentType.JE,
+              year: y.year,
+              title: `仕訳帳 ${y.year}年3月期`,
+              content: { sections },
+            });
+          }
+        } catch (e) {
+          console.warn(
+            "Bulk JE parse/validation failed for chunk, falling back to per-year generation",
+            e
+          );
+          // Fallback: per-year generateSingleDocument (which itself has fallback)
+          for (const y of chunk) {
+            try {
+              const doc = await generateSingleDocument(
+                company,
+                y,
+                DocumentType.JE
+              );
+              results.push(doc);
+            } catch (err) {
+              console.error("Fallback per-year JE failed", err);
+            }
+          }
+        }
+      } catch (err) {
+        console.error(
+          "Bulk JE generation call failed, falling back to per-year",
+          err
+        );
+        for (const y of chunk) {
+          try {
+            const doc = await generateSingleDocument(
+              company,
+              y,
+              DocumentType.JE
+            );
+            results.push(doc);
+          } catch (e) {
+            console.error("Fallback per-year JE failed", e);
+          }
+        }
+      }
+    }
+  } else if (type === DocumentType.NEWSLETTER) {
+    // Newsletter: bulk produce one newsletter per year in array
+    const newsItemSchema = z.object({ year: z.number(), content: z.string() });
+    const bulkNewsSchema = z.object({ newsletters: z.array(newsItemSchema) });
+
+    for (const chunk of chunks) {
+      const yearsContext = chunk
+        .map(
+          (y) =>
+            `Year:${y.year} Event:${y.companyEvent} Rev:${y.revenue}M Profit:${y.operatingProfit}M`
+        )
+        .join("\n");
+
+      const prompt = `Company: ${company.name}\nGenerate a short realistic Japanese internal newsletter message for each year listed below.\nRespond ONLY with JSON matching the provided schema.\nYears:\n${yearsContext}\n
+Return structure: { "newsletters": [ { "year": 2020, "content": "..." } ] }`;
+
+      try {
+        const modelToUse = preferredModel || "gemini-2.5-flash";
+        const response = await (ai.models.generateContent as any)({
+          model: modelToUse,
+          contents: prompt,
+          config: {
+            responseMimeType: "application/json",
+            responseJsonSchema: zodToJsonSchema(bulkNewsSchema as any),
+          },
+        } as any);
+
+        try {
+          const parsed = JSON.parse(response.text.trim());
+          const validated = bulkNewsSchema.parse(parsed);
+          for (const n of validated.newsletters) {
+            results.push({
+              id: `${DocumentType.NEWSLETTER}-${n.year}`,
+              type: DocumentType.NEWSLETTER,
+              year: n.year,
+              title: `社内報 ${n.year}年`,
+              content: n.content,
+            });
+          }
+        } catch (e) {
+          console.warn(
+            "Bulk NEWS parse/validation failed for chunk, falling back to per-year generation",
+            e
+          );
+          for (const y of chunk) {
+            try {
+              const doc = await generateSingleDocument(
+                company,
+                y,
+                DocumentType.NEWSLETTER
+              );
+              results.push(doc);
+            } catch (err) {
+              console.error("Fallback per-year NEWS failed", err);
+            }
+          }
+        }
+      } catch (err) {
+        console.error(
+          "Bulk NEWS generation call failed, falling back to per-year",
+          err
+        );
+        for (const y of chunk) {
+          try {
+            const doc = await generateSingleDocument(
+              company,
+              y,
+              DocumentType.NEWSLETTER
+            );
+            results.push(doc);
+          } catch (e) {
+            console.error("Fallback per-year NEWS failed", e);
+          }
+        }
+      }
+    }
+  } else {
+    // For other types, fallback to per-year generation
+    for (const y of history) {
+      try {
+        const doc = await generateSingleDocument(company, y, type);
+        results.push(doc);
+      } catch (e) {
+        console.error("Per-year generation failed for type", type, e);
+      }
+    }
+  }
+
+  return results;
+};
+
 // --- Single Document Generation (Heavy docs: JE, Newsletter) ---
 const generateSingleDocument = async (
   company: CompanyInput,
@@ -703,17 +935,33 @@ export const batchGenerateDocuments = async (
   }
 
   // 2. Generate API Docs (Serial with delay)
-  for (const h of history) {
-    for (const t of apiTypes) {
-      onProgress(completedCount, `${DOC_TYPE_LABELS[t]} (${h.year})`);
-      try {
-        const doc = await generateSingleDocument(company, h, t);
-        results.push(doc);
-      } catch (e) {
-        console.error(e);
+  // 2. Generate API Docs: use bulk generation per type (chunked) to reduce requests
+  const chooseModelForType = (t: DocumentType) => {
+    if (t === DocumentType.JE) return "gemini-2.5-flash-lite";
+    return "gemini-2.5-flash";
+  };
+
+  for (const t of apiTypes) {
+    onProgress(completedCount, `Generating ${DOC_TYPE_LABELS[t]} (bulk)`);
+    try {
+      const model = chooseModelForType(t);
+      const docs = await generateBulkDocuments(company, history, t, model);
+      results.push(...docs);
+      completedCount += docs.length;
+    } catch (e) {
+      console.error("Bulk generation failed for", t, e);
+      // As a final fallback, attempt per-year serial generation
+      for (const h of history) {
+        onProgress(completedCount, `${DOC_TYPE_LABELS[t]} (${h.year})`);
+        try {
+          const doc = await generateSingleDocument(company, h, t);
+          results.push(doc);
+        } catch (err) {
+          console.error(err);
+        }
+        completedCount++;
+        await delay(2000);
       }
-      completedCount++;
-      await delay(2000); // Rate limit buffer
     }
   }
 
