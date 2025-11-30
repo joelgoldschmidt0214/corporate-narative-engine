@@ -10,9 +10,15 @@ import {
   FinancialSection,
 } from "../types";
 import { logger } from "./logger";
+import activityLogger from "./activityLogger";
 import * as fs from "fs";
 import * as path from "path";
 
+// High-resolution timer helper that works in both browser and Node
+const nowMs = () =>
+  typeof performance !== "undefined" && typeof performance.now === "function"
+    ? performance.now()
+    : Date.now();
 const getClient = () => {
   const apiKey = process.env.API_KEY;
   if (!apiKey) {
@@ -111,6 +117,12 @@ export const autocompleteCompanyInfo = async (
   currentInput: Partial<CompanyInput>
 ): Promise<Partial<CompanyInput>> => {
   const ai = getClient();
+  activityLogger.logEvent("function_call", {
+    function: "autocompleteCompanyInfo",
+    companyName: currentInput.name || null,
+    note: "user-triggered autocomplete",
+  });
+  const tPromptStart = nowMs();
   const prompt = `
     以下の企業情報の空欄部分を、整合性が取れるようにリアルに埋めてください。
     これは中小企業シミュレーション用です。
@@ -140,12 +152,34 @@ export const autocompleteCompanyInfo = async (
     }
     ※ceoHistory: 設立が古い場合は必ず世代交代させてください。resignationYearが空文字なら現職。
   `;
+  const tPromptDone = nowMs();
 
   try {
+    const promptBuildMs = Math.round(tPromptDone - tPromptStart);
+    activityLogger.logEvent("api_request_sent", {
+      caller: "autocompleteCompanyInfo",
+      model: "gemini-2.5-flash",
+      promptPreview: (currentInput.name || "").slice(0, 200),
+      promptBuildMs,
+      ts: new Date().toISOString(),
+    });
+
+    const apiRequestT0 = nowMs();
     const response = await ai.models.generateContent({
       model: "gemini-2.5-flash",
       contents: prompt,
       config: { responseMimeType: "application/json" },
+    });
+
+    const apiResponseTime = Math.round(nowMs() - apiRequestT0);
+    activityLogger.logEvent("api_response_received", {
+      caller: "autocompleteCompanyInfo",
+      model: "gemini-2.5-flash",
+      promptBuildMs,
+      requestRoundtripMs: apiResponseTime,
+      durationMs: apiResponseTime,
+      respLength: response?.text?.length || 0,
+      tokens: (response as any)?.usage?.totalTokens || null,
     });
 
     let filled: any = null;
@@ -162,6 +196,10 @@ export const autocompleteCompanyInfo = async (
           "autocompleteCompanyInfo",
           response.text || ""
         );
+        activityLogger.logEvent("parse_error", {
+          function: "autocompleteCompanyInfo",
+          savedResponsePath: saved,
+        });
         throw new Error(
           `Failed to parse autocomplete response as JSON. Raw response saved: ${
             saved || "(not saved)"
@@ -188,6 +226,10 @@ export const autocompleteCompanyInfo = async (
     };
   } catch (e) {
     logger.error("Autocomplete failed", e);
+    activityLogger.logEvent("function_error", {
+      function: "autocompleteCompanyInfo",
+      error: String(e),
+    });
     return currentInput;
   }
 };
@@ -203,9 +245,15 @@ export const generateCompanyHistory = async (
     input.foundedYear,
     input.currentYear
   );
+  activityLogger.logEvent("function_call", {
+    function: "generateCompanyHistory",
+    companyName: input.name,
+    range: `${input.foundedYear}-${input.currentYear}`,
+  });
   const endYear = Number(input.currentYear) || new Date().getFullYear();
   const startYear = Number(input.foundedYear);
 
+  const tPromptStart = nowMs();
   const prompt = `
     あなたは日本のSME（中小企業）に精通した経営コンサルタントです。
     以下の企業の、**非常にシビアでリアルな**財務・経営の歴史を作成してください。
@@ -257,11 +305,31 @@ export const generateCompanyHistory = async (
     ]
   `;
 
+  const tPromptDone = nowMs();
+
   try {
+    const promptBuildMs = Math.round(tPromptDone - tPromptStart);
+    activityLogger.logEvent("api_request_sent", {
+      caller: "generateCompanyHistory",
+      model: "gemini-2.5-flash",
+      years: `${input.foundedYear}-${input.currentYear}`,
+      promptBuildMs,
+    });
+    const apiRequestT0 = nowMs();
     const response = await ai.models.generateContent({
       model: "gemini-2.5-flash",
       contents: prompt,
       config: { responseMimeType: "application/json" },
+    });
+    const apiResponseTime = Math.round(nowMs() - apiRequestT0);
+    activityLogger.logEvent("api_response_received", {
+      caller: "generateCompanyHistory",
+      model: "gemini-2.5-flash",
+      promptBuildMs,
+      requestRoundtripMs: apiResponseTime,
+      durationMs: apiResponseTime,
+      respLength: response?.text?.length || 0,
+      tokens: (response as any)?.usage?.totalTokens || null,
     });
 
     let parsed: any = null;
@@ -282,6 +350,10 @@ export const generateCompanyHistory = async (
           "generateCompanyHistory: failed to parse AI response as JSON",
           { saved }
         );
+        activityLogger.logEvent("parse_error", {
+          function: "generateCompanyHistory",
+          savedResponsePath: saved,
+        });
         throw new Error(
           `Failed to parse generateCompanyHistory response as JSON. Raw response saved: ${
             saved || "(not saved)"
@@ -657,13 +729,25 @@ Units: YEN. Use integers. Do not include extraneous text.`;
 
       try {
         const modelToUse = preferredModel || "gemini-2.5-flash-lite";
+        // measure prompt build time
+        const tPromptStart = nowMs();
+        // prompt was built above (yearsContext + prompt string)
+        const tPromptDone = nowMs();
+        const promptBuildMs = Math.round(tPromptDone - tPromptStart);
+
+        activityLogger.logEvent("api_request_sent", {
+          caller: "generateBulkDocuments:JE",
+          model: modelToUse,
+          years: chunk.map((c) => c.year),
+          promptBuildMs,
+        });
+        const apiRequestT0 = nowMs();
         logger.info("Bulk JE request start", {
           model: modelToUse,
           years: chunk.map((c) => c.year),
           chunkSize: CHUNK_YEARS,
           ts: new Date().toISOString(),
         });
-        const t0 = Date.now();
         const response = await (ai.models.generateContent as any)({
           model: modelToUse,
           contents: prompt,
@@ -672,11 +756,20 @@ Units: YEN. Use integers. Do not include extraneous text.`;
             responseJsonSchema: zodToJsonSchema(bulkSchema as any),
           },
         } as any);
-        const duration = Date.now() - t0;
+        const duration = Math.round(nowMs() - apiRequestT0);
+        const apiResponseTime = duration;
         logger.info("Bulk JE request end", {
           years: chunk.map((c) => c.year),
           durationMs: duration,
           respLength: response.text?.length || 0,
+        });
+        activityLogger.logEvent("api_response_received", {
+          caller: "generateBulkDocuments:JE",
+          model: modelToUse,
+          years: chunk.map((c) => c.year),
+          durationMs: apiResponseTime,
+          respLength: response?.text?.length || 0,
+          tokens: (response as any)?.usage?.totalTokens || null,
         });
         logger.debug("Bulk JE response length", response.text?.length || 0);
         let parsed: any = null;
@@ -749,6 +842,11 @@ Units: YEN. Use integers. Do not include extraneous text.`;
             "Bulk JE parse/validation failed for chunk, falling back to per-year generation",
             e
           );
+          activityLogger.logEvent("parse_error", {
+            function: "generateBulkDocuments:JE",
+            years: chunk.map((c) => c.year),
+            error: String(e),
+          });
           // Fallback: per-year generateSingleDocument (which itself has fallback)
           for (const y of chunk) {
             try {
@@ -800,13 +898,24 @@ Return structure: { "newsletters": [ { "year": 2020, "content": "..." } ] }`;
 
       try {
         const modelToUse = preferredModel || "gemini-2.5-flash";
+        // measure prompt build time (prompt constructed above)
+        const tPromptStart = nowMs();
+        const tPromptDone = nowMs();
+        const promptBuildMs = Math.round(tPromptDone - tPromptStart);
+
+        activityLogger.logEvent("api_request_sent", {
+          caller: "generateBulkDocuments:NEWSLETTER",
+          model: modelToUse,
+          years: chunk.map((c) => c.year),
+          promptBuildMs,
+        });
+        const apiRequestT0 = nowMs();
         logger.info("Bulk NEWS request start", {
           model: modelToUse,
           years: chunk.map((c) => c.year),
           chunkSize: CHUNK_YEARS,
           ts: new Date().toISOString(),
         });
-        const t0 = Date.now();
         const response = await (ai.models.generateContent as any)({
           model: modelToUse,
           contents: prompt,
@@ -815,13 +924,22 @@ Return structure: { "newsletters": [ { "year": 2020, "content": "..." } ] }`;
             responseJsonSchema: zodToJsonSchema(bulkNewsSchema as any),
           },
         } as any);
-        const duration = Date.now() - t0;
+        const duration = Math.round(nowMs() - apiRequestT0);
+        const apiResponseTime = duration;
         logger.info("Bulk NEWS request end", {
           years: chunk.map((c) => c.year),
           durationMs: duration,
           respLength: response.text?.length || 0,
         });
         logger.debug("Bulk NEWS response length", response.text?.length || 0);
+        activityLogger.logEvent("api_response_received", {
+          caller: "generateBulkDocuments:NEWSLETTER",
+          model: modelToUse,
+          years: chunk.map((c) => c.year),
+          durationMs: apiResponseTime,
+          respLength: response?.text?.length || 0,
+          tokens: (response as any)?.usage?.totalTokens || null,
+        });
         try {
           let parsed: any = safeParseJson(response.text);
           if (
@@ -858,6 +976,11 @@ Return structure: { "newsletters": [ { "year": 2020, "content": "..." } ] }`;
             "Bulk NEWS parse/validation failed for chunk, falling back to per-year generation",
             e
           );
+          activityLogger.logEvent("parse_error", {
+            function: "generateBulkDocuments:NEWSLETTER",
+            years: chunk.map((c) => c.year),
+            error: String(e),
+          });
           for (const y of chunk) {
             try {
               const doc = await generateSingleDocument(
@@ -927,6 +1050,7 @@ const generateSingleDocument = async (
   `;
 
   if (type === DocumentType.NEWSLETTER) {
+    const tPromptStart = nowMs();
     const prompt = `
       ${basePrompt}
       Write a realistic Japanese company newsletter (社内報) message from the CEO.
@@ -937,9 +1061,21 @@ const generateSingleDocument = async (
       }.
       Format: Markdown. Insert blank lines between paragraphs.
     `;
+    const tPromptDone = nowMs();
+    const promptBuildMs = Math.round(tPromptDone - tPromptStart);
+    const apiRequestT0 = nowMs();
     const res = await ai.models.generateContent({
       model: "gemini-2.5-flash",
       contents: prompt,
+    });
+    const apiRoundtripMs = Math.round(nowMs() - apiRequestT0);
+    activityLogger.logEvent("api_response_received", {
+      caller: "generateSingleDocument:NEWSLETTER",
+      model: "gemini-2.5-flash",
+      promptBuildMs,
+      requestRoundtripMs: apiRoundtripMs,
+      respLength: res.text?.length || 0,
+      tokens: (res as any)?.usage?.totalTokens || null,
     });
     return {
       id: `${type}-${yearData.year}`,
@@ -964,10 +1100,24 @@ const generateSingleDocument = async (
     `;
 
     try {
+      const tPromptStart = nowMs();
+      // prompt built above as `prompt`
+      const tPromptDone = nowMs();
+      const promptBuildMs = Math.round(tPromptDone - tPromptStart);
+      const apiRequestT0 = nowMs();
       const res = await ai.models.generateContent({
         model: "gemini-2.5-flash",
         contents: prompt,
         config: { responseMimeType: "application/json" },
+      });
+      const apiRoundtripMs = Math.round(nowMs() - apiRequestT0);
+      activityLogger.logEvent("api_response_received", {
+        caller: `generateSingleDocument:JE:${yearData.year}`,
+        model: "gemini-2.5-flash",
+        promptBuildMs,
+        requestRoundtripMs: apiRoundtripMs,
+        respLength: res.text?.length || 0,
+        tokens: (res as any)?.usage?.totalTokens || null,
       });
 
       let parsed: any = null;
