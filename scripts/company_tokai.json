@@ -1,0 +1,16 @@
+{
+    "name": "株式会社東海部品加工",
+    "industry": "製造業",
+    "foundedYear": 1998,
+    "currentYear": 2025,
+    "initialEmployees": 10,
+    "currentEmployees": 45,
+    "persona": "二代目社長、現場上がりで保守的。数字に厳しいが人手不足に弱い。",
+    "keyEvents": "熟練工の定年退職が続き、人手不足と生産性低下が深刻。銀行交渉が続く。",
+    "ceoHistory": [
+        {
+            "name": "二代目社長",
+            "resignationYear": ""
+        }
+    ]
+}

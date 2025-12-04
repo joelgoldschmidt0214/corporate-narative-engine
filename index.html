@@ -10,18 +10,23 @@
         theme: {
           extend: {
             fontFamily: {
-              sans: ['"Noto Sans JP"', '"Hiragino Kaku Gothic ProN"', '"Meiryo"', 'sans-serif'],
-              serif: ['"Noto Serif JP"', '"Hiragino Mincho ProN"', 'serif'],
+              sans: [
+                '"Noto Sans JP"',
+                '"Hiragino Kaku Gothic ProN"',
+                '"Meiryo"',
+                "sans-serif",
+              ],
+              serif: ['"Noto Serif JP"', '"Hiragino Mincho ProN"', "serif"],
             },
             colors: {
               slate: {
-                850: '#1e293b',
-                900: '#0f172a',
-              }
-            }
-          }
-        }
-      }
+                850: "#1e293b",
+                900: "#0f172a",
+              },
+            },
+          },
+        },
+      };
     </script>
     <style>
       body {
@@ -30,13 +35,13 @@
       }
       /* Custom scrollbar for table containers */
       .scrollbar-hide::-webkit-scrollbar {
-          display: none;
+        display: none;
       }
       .scrollbar-hide {
-          -ms-overflow-style: none;
-          scrollbar-width: none;
+        -ms-overflow-style: none;
+        scrollbar-width: none;
       }
-      
+
       /* Print styles for PDF generation capture */
       .print-container {
         position: fixed;
@@ -48,24 +53,10 @@
         padding: 20mm;
       }
     </style>
-  <script type="importmap">
-{
-  "imports": {
-    "react": "https://aistudiocdn.com/react@^19.2.0",
-    "react-dom/": "https://aistudiocdn.com/react-dom@^19.2.0/",
-    "react/": "https://aistudiocdn.com/react@^19.2.0/",
-    "@google/genai": "https://aistudiocdn.com/@google/genai@^1.30.0",
-    "lucide-react": "https://aistudiocdn.com/lucide-react@^0.555.0",
-    "recharts": "https://aistudiocdn.com/recharts@^3.5.0",
-    "react-markdown": "https://aistudiocdn.com/react-markdown@^10.1.0",
-    "jszip": "https://aistudiocdn.com/jszip@^3.10.1",
-    "jspdf": "https://aistudiocdn.com/jspdf@^3.0.4",
-    "html2canvas": "https://aistudiocdn.com/html2canvas@^1.4.1"
-  }
-}
-</script>
-</head>
+    <!-- Let Vite/Bundler resolve imports from node_modules during dev/build. -->
+  </head>
   <body>
     <div id="root"></div>
+    <script type="module" src="/index.tsx"></script>
   </body>
 </html>
