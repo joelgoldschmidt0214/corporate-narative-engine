@@ -1,6 +1,4 @@
-import { GoogleGenAI } from "@google/genai";
-import { z } from "zod";
-import { zodToJsonSchema } from "zod-to-json-schema";
+import { GoogleGenAI, Type } from "@google/genai";
 import type {
   CompanyInput,
   YearlyData,
@@ -23,6 +21,68 @@ export const DocumentType = {
 } as const;
 import * as fs from "fs";
 import * as path from "path";
+
+// ========== Gemini Structured Output Schemas (native format) ==========
+// JE (Journal Entry) bulk schema - using Gemini's native Type system
+const JE_BULK_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    years: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          year: { type: Type.NUMBER },
+          months: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                title: { type: Type.STRING },
+                items: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      date: { type: Type.STRING },
+                      account: { type: Type.STRING },
+                      debit: { type: Type.NUMBER },
+                      credit: { type: Type.NUMBER },
+                      label: { type: Type.STRING },
+                    },
+                    required: ["date", "account"],
+                  },
+                },
+              },
+              required: ["title", "items"],
+            },
+          },
+        },
+        required: ["year", "months"],
+      },
+    },
+  },
+  required: ["years"],
+};
+
+// Newsletter bulk schema
+const NEWSLETTER_BULK_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    newsletters: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          year: { type: Type.NUMBER },
+          content: { type: Type.STRING },
+        },
+        required: ["year", "content"],
+      },
+    },
+  },
+  required: ["newsletters"],
+};
 
 // High-resolution timer helper that works in both browser and Node
 const nowMs = () =>
@@ -1056,7 +1116,7 @@ export const generateLocalFinancialDocuments = (
   };
 };
 
-// --- Bulk Generation (chunked, structured output) ---
+// --- Bulk Generation (chunked, using Gemini native structured output) ---
 export const generateBulkDocuments = async (
   company: CompanyInput,
   history: YearlyData[],
@@ -1067,11 +1127,8 @@ export const generateBulkDocuments = async (
   const results: GeneratedDocument[] = [];
 
   // Chunk history into groups to avoid token limits; configurable via VITE_CHUNK_YEARS
-  // Read VITE_CHUNK_YEARS from Node env or Vite's import.meta.env, default to 10
   const _envChunk =
-    typeof process !== "undefined" &&
-    process.env &&
-    process.env.VITE_CHUNK_YEARS
+    typeof process !== "undefined" && process.env?.VITE_CHUNK_YEARS
       ? process.env.VITE_CHUNK_YEARS
       : typeof import.meta !== "undefined"
       ? (import.meta as any).env?.VITE_CHUNK_YEARS
@@ -1079,29 +1136,15 @@ export const generateBulkDocuments = async (
   const CHUNK_YEARS = Number(_envChunk ?? 10) || 10;
   const chunks = chunkArray(history, CHUNK_YEARS);
 
-  // Define schemas per type
-  if (type === DocumentType.JE) {
-    const itemSchema: z.ZodType<any> = z.object({
-      date: z.string(),
-      account: z.string(),
-      debit: z.number().optional(),
-      credit: z.number().optional(),
-      label: z.string().optional(),
-    });
-    const monthSchema: z.ZodType<any> = z.object({
-      title: z.string(),
-      breakPage: z.boolean().optional(),
-      headers: z.array(z.string()).optional(),
-      items: z.array(itemSchema),
-    });
-    const yearSchema: z.ZodType<any> = z.object({
-      year: z.number(),
-      months: z.array(monthSchema),
-    });
-    const bulkSchema: z.ZodType<any> = z.object({ years: z.array(yearSchema) });
+  logger.info("generateBulkDocuments started", {
+    type,
+    totalYears: history.length,
+    chunkSize: CHUNK_YEARS,
+    numChunks: chunks.length,
+  });
 
+  if (type === DocumentType.JE) {
     for (const chunk of chunks) {
-      // Build prompt with per-year context (compact)
       const yearsContext = chunk
         .map(
           (y) =>
@@ -1109,186 +1152,88 @@ export const generateBulkDocuments = async (
         )
         .join("\n");
 
-      const prompt = `Company: ${company.name}\nProvide monthly summary journal entries for the following years (Apr-Mar).\nRespond ONLY with JSON matching the provided schema.\nYears:\n${yearsContext}\n
-Return structure: { "years": [ { "year": 2020, "months": [ { "title": "4月", "items": [{ "date":"4/30","account":"売掛金","debit":100000,"credit":0,"label":"..." }] } ] } ] }\n
-Units: YEN. Use integers. Do not include extraneous text.`;
+      const prompt = `あなたは日本の中小企業の経理担当です。
+会社名: ${company.name}
+
+以下の年度について、月次合計仕訳を生成してください。各年度は4月〜3月の12ヶ月分です。
+
+【対象年度データ】
+${yearsContext}
+
+【出力形式】
+- 各年度ごとに12ヶ月分の仕訳を含める
+- 各月に5件程度の代表的な仕訳を記載
+- 金額は円単位（百万円ではない）
+- 売上・仕入・給与・家賃・減価償却などの典型的な仕訳を含める`;
+
+      const modelToUse = preferredModel || "gemini-2.5-flash";
+      const requestId = `JE-${chunk
+        .map((c) => c.year)
+        .join("-")}-${Date.now()}`;
+
+      logger.info(`[${requestId}] Bulk JE request start`, {
+        model: modelToUse,
+        years: chunk.map((c) => c.year),
+      });
+
+      activityLogger.logEvent("api_request_sent", {
+        caller: "generateBulkDocuments:JE",
+        requestId,
+        model: modelToUse,
+        years: chunk.map((c) => c.year),
+        prompt: prompt.slice(0, 500),
+      });
 
       try {
-        const modelToUse = preferredModel || "gemini-2.5-flash-lite";
-        // measure prompt build time
-        const tPromptStart = nowMs();
-        // prompt was built above (yearsContext + prompt string)
-        const tPromptDone = nowMs();
-        const promptBuildMs = Math.round(tPromptDone - tPromptStart);
-
-        // Emit the final assembled prompt to console for reproduction/inspection.
-        try {
-          console.log(
-            `AI PROMPT (generateBulkDocuments:JE) years=${chunk
-              .map((c) => c.year)
-              .join(",")} :`,
-            prompt
-          );
-        } catch (e) {
-          /* ignore logging failures */
-        }
-
-        activityLogger.logEvent("api_request_sent", {
-          caller: "generateBulkDocuments:JE",
-          model: modelToUse,
-          years: chunk.map((c) => c.year),
-          promptBuildMs,
-        });
         const apiRequestT0 = nowMs();
-        logger.info("Bulk JE request start", {
-          model: modelToUse,
-          years: chunk.map((c) => c.year),
-          chunkSize: CHUNK_YEARS,
-          ts: new Date().toISOString(),
-        });
-        // Optionally persist the exact prompt used for offline repro/debugging
-        try {
-          if (
-            typeof process !== "undefined" &&
-            process.env &&
-            process.env.SAVE_PROMPT === "1"
-          ) {
-            saveDebugResponse(
-              `prompt_generateBulkDocuments:JE-${chunk
-                .map((c) => c.year)
-                .join("-")}`,
-              prompt
-            );
-          }
-        } catch (_p) {
-          /* ignore */
-        }
-
-        const response = await (ai.models.generateContent as any)({
+        const response = await ai.models.generateContent({
           model: modelToUse,
           contents: prompt,
           config: {
             responseMimeType: "application/json",
-            responseJsonSchema: zodToJsonSchema(bulkSchema as any),
+            responseSchema: JE_BULK_SCHEMA,
           },
-        } as any);
+        });
         const duration = Math.round(nowMs() - apiRequestT0);
-        const apiResponseTime = duration;
-        logger.info("Bulk JE request end", {
-          years: chunk.map((c) => c.year),
+
+        logger.info(`[${requestId}] Bulk JE response received`, {
           durationMs: duration,
           respLength: response.text?.length || 0,
         });
+
         activityLogger.logEvent("api_response_received", {
           caller: "generateBulkDocuments:JE",
-          model: modelToUse,
-          years: chunk.map((c) => c.year),
-          durationMs: apiResponseTime,
-          respLength: response?.text?.length || 0,
-          tokens: (response as any)?.usage?.totalTokens || null,
+          requestId,
+          durationMs: duration,
+          respLength: response.text?.length || 0,
         });
-        logger.debug("Bulk JE response length", response.text?.length || 0);
+
+        // Parse response
         let parsed: any = null;
         try {
-          parsed = safeParseJson(response.text);
+          parsed = JSON.parse(response.text?.trim() || "{}");
+        } catch (e) {
+          logger.warn(
+            `[${requestId}] JSON.parse failed, trying safeParseJson`,
+            e
+          );
+          parsed = safeParseJson(response.text || "");
+        }
 
-          // If model returned multiple JSON blocks (array of objects), merge them.
-          if (Array.isArray(parsed)) {
-            if (
-              parsed.length > 0 &&
-              parsed.every((p) => typeof p === "object" && p !== null)
-            ) {
-              const merged: any = {};
-              for (const part of parsed) {
-                for (const k of Object.keys(part)) {
-                  if (Array.isArray(merged[k]) && Array.isArray(part[k])) {
-                    merged[k] = merged[k].concat(part[k]);
-                  } else if (
-                    merged[k] &&
-                    typeof merged[k] === "object" &&
-                    part[k] &&
-                    typeof part[k] === "object"
-                  ) {
-                    merged[k] = { ...merged[k], ...part[k] };
-                  } else {
-                    merged[k] = part[k];
-                  }
-                }
-              }
-              parsed = merged;
-            } else if (parsed.length > 0 && typeof parsed[0] === "string") {
-              // join lines and try reparsing as object
-              const tryJoin = parsed.join("\n");
-              const reparsed = safeParseJson(tryJoin);
-              if (reparsed) parsed = reparsed;
-            }
-          }
+        // Validate and transform
+        if (parsed?.years && Array.isArray(parsed.years)) {
+          for (const y of parsed.years) {
+            if (!y.year || !Array.isArray(y.months)) continue;
 
-          // Attempt coarse normalization for JE when the model returned primitive/fragmented arrays
-          try {
-            parsed = normalizeJE(
-              parsed,
-              response.text,
-              chunk.map((c) => c.year)
-            );
-          } catch (_err) {
-            /* non-fatal */
-          }
-
-          // If parsed is an object but some keys contain JSON strings, attempt to normalize further below.
-
-          // If parsed.years contains string items, attempt to parse each
-          if (
-            parsed &&
-            Array.isArray(parsed.years) &&
-            parsed.years.length > 0 &&
-            typeof parsed.years[0] === "string"
-          ) {
-            const normalizedYears: any[] = [];
-            for (const it of parsed.years) {
-              if (typeof it === "string") {
-                const p = safeParseJson(it);
-                normalizedYears.push(p || it);
-              } else normalizedYears.push(it);
-            }
-            parsed.years = normalizedYears;
-          }
-
-          // If parsed.years is an array of primitive numbers (e.g. [2020,2021,...]),
-          // convert them into objects so zod validation can succeed: { year: N, months: [] }
-          if (parsed && Array.isArray(parsed.years)) {
-            const isNumericYears = parsed.years.every(
-              (it: any) => typeof it === "number"
-            );
-            if (isNumericYears) {
-              parsed.years = parsed.years.map((y: number) => ({
-                year: y,
-                months: [],
-              }));
-            }
-          }
-
-          // Validate with zod
-          const validated = bulkSchema.parse(parsed);
-
-          for (const y of validated.years) {
-            // Map months -> sections for GeneratedDocument
             const sections = y.months.map((m: any) => ({
-              title: m.title,
-              breakPage: m.breakPage || false,
-              headers: m.headers || [
-                "日付",
-                "借方",
-                "金額",
-                "貸方",
-                "金額",
-                "摘要",
-              ],
-              items: m.items.map((it: any) => ({
-                date: it.date,
-                account: it.account,
-                debit: it.debit ?? 0,
-                credit: it.credit ?? 0,
+              title: m.title || "",
+              breakPage: false,
+              headers: ["日付", "借方", "金額", "貸方", "金額", "摘要"],
+              items: (m.items || []).map((it: any) => ({
+                date: it.date || "",
+                account: it.account || "",
+                debit: Number(it.debit) || 0,
+                credit: Number(it.credit) || 0,
                 label: it.label || "",
               })),
             }));
@@ -1300,224 +1245,128 @@ Units: YEN. Use integers. Do not include extraneous text.`;
               title: `仕訳帳 ${y.year}年3月期`,
               content: { sections },
             });
+            logger.debug(`[${requestId}] Added JE document for year ${y.year}`);
           }
-        } catch (e) {
-          // On parse/validation failure: save raw response and produce fallback docs
-          logger.warn(
-            "Bulk JE parse/validation failed for chunk; saving raw response and producing fallback docs",
-            e
-          );
-          let saved: string | null = null;
-          try {
-            saved = saveDebugResponse(
-              `generateBulkDocuments:JE-${chunk.map((c) => c.year).join("-")}`,
-              response?.text || String(e)
-            );
-          } catch (_ee) {
-            /* ignore */
-          }
-          activityLogger.logEvent("parse_error", {
-            function: "generateBulkDocuments:JE",
-            years: chunk.map((c) => c.year),
-            error: String(e),
-            savedResponsePath: saved,
-          });
-
-          // Create placeholder/fallback GeneratedDocument per year in the chunk so batch continues
-          for (const y of chunk) {
-            results.push({
-              id: `${DocumentType.JE}-${y.year}`,
-              type: DocumentType.JE,
-              year: y.year,
-              title: `仕訳帳 ${y.year}年3月期 (PARSE_FAILED)`,
-              content: {
-                parsingFailed: true,
-                rawResponsePath: saved,
-                rawResponsePreview:
-                  (response?.text && String(response.text).slice(0, 4000)) ||
-                  String(e).slice(0, 4000),
-              },
-            });
-          }
+        } else {
+          throw new Error("Invalid response structure: missing years array");
         }
       } catch (err) {
-        logger.error(
-          "Bulk JE generation call failed, falling back to per-year",
-          err
-        );
+        logger.error(`[${requestId}] Bulk JE generation failed`, err);
+        const saved = saveDebugResponse(requestId, String(err));
+        activityLogger.logEvent("parse_error", {
+          function: "generateBulkDocuments:JE",
+          requestId,
+          error: String(err),
+          savedResponsePath: saved,
+        });
+
+        // Fallback: generate placeholder docs for this chunk
         for (const y of chunk) {
-          try {
-            const doc = await generateSingleDocument(
-              company,
-              y,
-              DocumentType.JE
-            );
-            results.push(doc);
-          } catch (e) {
-            logger.error("Fallback per-year JE failed", e);
-          }
+          results.push({
+            id: `${DocumentType.JE}-${y.year}`,
+            type: DocumentType.JE,
+            year: y.year,
+            title: `仕訳帳 ${y.year}年3月期 (生成失敗)`,
+            content: { sections: generateFallbackJESections(y) },
+          });
         }
+      }
+
+      // Rate limit delay between chunks
+      if (chunks.indexOf(chunk) < chunks.length - 1) {
+        await delay(1500);
       }
     }
   } else if (type === DocumentType.NEWSLETTER) {
-    // Newsletter: bulk produce one newsletter per year in array
-    const newsItemSchema = z.object({ year: z.number(), content: z.string() });
-    const bulkNewsSchema = z.object({ newsletters: z.array(newsItemSchema) });
-
     for (const chunk of chunks) {
       const yearsContext = chunk
         .map(
           (y) =>
-            `Year:${y.year} Event:${y.companyEvent} Rev:${y.revenue}M Profit:${y.operatingProfit}M`
+            `${y.year}年: 売上${y.revenue}百万円, 営業利益${y.operatingProfit}百万円, 出来事「${y.companyEvent}」`
         )
         .join("\n");
 
-      const prompt = `Company: ${company.name}\nGenerate a short realistic Japanese internal newsletter message for each year listed below.\nRespond ONLY with JSON matching the provided schema.\nYears:\n${yearsContext}\n
-Return structure: { "newsletters": [ { "year": 2020, "content": "..." } ] }`;
+      const prompt = `あなたは日本の中小企業の社長です。
+会社名: ${company.name}
+業種: ${company.industry}
+
+以下の各年度について、社内報に掲載する社長メッセージを作成してください。
+
+【対象年度】
+${yearsContext}
+
+【執筆ガイドライン】
+- 赤字の年は厳しい現実を認めつつ再建への決意を示す
+- 黒字の年は慎重な楽観と感謝を表現
+- 200〜400文字程度の日本語テキスト
+- 形式的すぎない、人間味のある文章
+
+【重要：出力フォーマット】
+contentフィールドには、純粋な日本語テキストのみを返してください。
+- Markdownの見出し（# ## ###）や箇条書き（- *）は使用しないでください
+- 段落の区切りは改行2つで表現してください
+- 特殊文字やエンコードされた文字は使用しないでください
+- UTF-8の日本語テキストのみを返してください`;
+
+      const modelToUse = preferredModel || "gemini-2.5-flash";
+      const requestId = `NEWS-${chunk
+        .map((c) => c.year)
+        .join("-")}-${Date.now()}`;
+
+      logger.info(`[${requestId}] Bulk NEWSLETTER request start`, {
+        model: modelToUse,
+        years: chunk.map((c) => c.year),
+      });
+
+      activityLogger.logEvent("api_request_sent", {
+        caller: "generateBulkDocuments:NEWSLETTER",
+        requestId,
+        model: modelToUse,
+        years: chunk.map((c) => c.year),
+        prompt: prompt.slice(0, 500),
+      });
 
       try {
-        const modelToUse = preferredModel || "gemini-2.5-flash";
-        // measure prompt build time (prompt constructed above)
-        const tPromptStart = nowMs();
-        const tPromptDone = nowMs();
-        const promptBuildMs = Math.round(tPromptDone - tPromptStart);
-
-        // Emit the final assembled prompt to console for reproduction/inspection.
-        try {
-          console.log(
-            `AI PROMPT (generateBulkDocuments:NEWSLETTER) years=${chunk
-              .map((c) => c.year)
-              .join(",")} :`,
-            prompt
-          );
-        } catch (e) {
-          /* ignore logging failures */
-        }
-
-        activityLogger.logEvent("api_request_sent", {
-          caller: "generateBulkDocuments:NEWSLETTER",
-          model: modelToUse,
-          years: chunk.map((c) => c.year),
-          promptBuildMs,
-        });
         const apiRequestT0 = nowMs();
-        logger.info("Bulk NEWS request start", {
-          model: modelToUse,
-          years: chunk.map((c) => c.year),
-          chunkSize: CHUNK_YEARS,
-          ts: new Date().toISOString(),
-        });
-        // Optionally persist the exact prompt used for offline repro/debugging
-        try {
-          if (
-            typeof process !== "undefined" &&
-            process.env &&
-            process.env.SAVE_PROMPT === "1"
-          ) {
-            saveDebugResponse(
-              `prompt_generateBulkDocuments:NEWSLETTER-${chunk
-                .map((c) => c.year)
-                .join("-")}`,
-              prompt
-            );
-          }
-        } catch (_p) {
-          /* ignore */
-        }
-
-        const response = await (ai.models.generateContent as any)({
+        const response = await ai.models.generateContent({
           model: modelToUse,
           contents: prompt,
           config: {
             responseMimeType: "application/json",
-            responseJsonSchema: zodToJsonSchema(bulkNewsSchema as any),
+            responseSchema: NEWSLETTER_BULK_SCHEMA,
           },
-        } as any);
+        });
         const duration = Math.round(nowMs() - apiRequestT0);
-        const apiResponseTime = duration;
-        logger.info("Bulk NEWS request end", {
-          years: chunk.map((c) => c.year),
+
+        logger.info(`[${requestId}] Bulk NEWSLETTER response received`, {
           durationMs: duration,
           respLength: response.text?.length || 0,
         });
-        logger.debug("Bulk NEWS response length", response.text?.length || 0);
+
         activityLogger.logEvent("api_response_received", {
           caller: "generateBulkDocuments:NEWSLETTER",
-          model: modelToUse,
-          years: chunk.map((c) => c.year),
-          durationMs: apiResponseTime,
-          respLength: response?.text?.length || 0,
-          tokens: (response as any)?.usage?.totalTokens || null,
+          requestId,
+          durationMs: duration,
+          respLength: response.text?.length || 0,
         });
+
+        // Parse response
+        let parsed: any = null;
         try {
-          let parsed: any = null;
-          if (typeof response.text === "string")
-            parsed = safeParseJson(response.text);
-          else parsed = response.text;
+          parsed = JSON.parse(response.text?.trim() || "{}");
+        } catch (e) {
+          logger.warn(
+            `[${requestId}] JSON.parse failed, trying safeParseJson`,
+            e
+          );
+          parsed = safeParseJson(response.text || "");
+        }
 
-          try {
-            let parsed: any = null;
-            if (typeof response.text === "string")
-              parsed = safeParseJson(response.text);
-            else parsed = response.text;
+        // Validate and transform
+        if (parsed?.newsletters && Array.isArray(parsed.newsletters)) {
+          for (const n of parsed.newsletters) {
+            if (!n.year || !n.content) continue;
 
-            if (
-              Array.isArray(parsed) &&
-              parsed.length > 0 &&
-              typeof parsed[0] === "string"
-            ) {
-              const join = parsed.join("\n");
-              const reparsed = safeParseJson(join);
-              if (reparsed) parsed = reparsed;
-            }
-            parsed = normalizeNewsletters(
-              parsed,
-              response.text,
-              chunk.map((c) => c.year)
-            );
-          } catch (_err) {
-            /* non-fatal */
-          }
-
-          // If newsletters is an array of primitives (numbers/strings), normalize into objects
-          // If response contains separate arrays like `years` and `entries`, synthesize `newsletters`
-          if (
-            parsed &&
-            !parsed.newsletters &&
-            Array.isArray(parsed.years) &&
-            Array.isArray(parsed.entries) &&
-            parsed.years.length === parsed.entries.length
-          ) {
-            parsed.newsletters = parsed.years.map((y: any, idx: number) => ({
-              year: Number(y) || (chunk[idx] ? chunk[idx].year : null),
-              content: String(parsed.entries[idx] || ""),
-            }));
-          }
-
-          if (parsed && Array.isArray(parsed.newsletters)) {
-            const items = parsed.newsletters;
-            const isPrimitiveArray = items.every(
-              (it: any) => typeof it !== "object" || it === null
-            );
-            if (isPrimitiveArray) {
-              // Map by chunk order if lengths align, otherwise try to coerce by index
-              parsed.newsletters = items.map((it: any, idx: number) => {
-                const year = chunk[idx] ? chunk[idx].year : Number(it) || null;
-                return {
-                  year: typeof it === "number" && !isNaN(it) ? it : year,
-                  content: typeof it === "string" ? it : String(it || ""),
-                } as any;
-              });
-            } else {
-              // if items are strings that may contain JSON, try parsing each
-              parsed.newsletters = items.map(
-                (it: any) => safeParseJson(it) || it
-              );
-            }
-          }
-
-          const validated = bulkNewsSchema.parse(parsed);
-          for (const n of validated.newsletters) {
             results.push({
               id: `${DocumentType.NEWSLETTER}-${n.year}`,
               type: DocumentType.NEWSLETTER,
@@ -1525,59 +1374,38 @@ Return structure: { "newsletters": [ { "year": 2020, "content": "..." } ] }`;
               title: `社内報 ${n.year}年`,
               content: n.content,
             });
+            logger.debug(`[${requestId}] Added NEWSLETTER for year ${n.year}`);
           }
-        } catch (e) {
-          // Don't auto-fallback to per-year generation here; save raw response for analysis
-          logger.warn(
-            "Bulk NEWS parse/validation failed for chunk; saving raw response for analysis",
-            e
+        } else {
+          throw new Error(
+            "Invalid response structure: missing newsletters array"
           );
-          try {
-            const saved = saveDebugResponse(
-              `generateBulkDocuments:NEWSLETTER-${chunk
-                .map((c) => c.year)
-                .join("-")}`,
-              response?.text || String(e)
-            );
-            activityLogger.logEvent("parse_error", {
-              function: "generateBulkDocuments:NEWSLETTER",
-              years: chunk.map((c) => c.year),
-              error: String(e),
-              savedResponsePath: saved,
-            });
-          } catch (ee) {
-            activityLogger.logEvent("parse_error", {
-              function: "generateBulkDocuments:NEWSLETTER",
-              years: chunk.map((c) => c.year),
-              error: String(e),
-            });
-          }
-          // skip this chunk (investigation mode)
         }
       } catch (err) {
-        // On API error, do not automatically fallback to per-year; save for analysis.
-        logger.error("Bulk NEWS generation call failed (no fallback):", err);
-        try {
-          const saved = saveDebugResponse(
-            `generateBulkDocuments:NEWSLETTER-err-${chunk
-              .map((c) => c.year)
-              .join("-")}`,
-            String(err)
-          );
-          activityLogger.logEvent("function_error", {
-            function: "generateBulkDocuments:NEWSLETTER",
-            years: chunk.map((c) => c.year),
-            error: String(err),
-            savedResponsePath: saved,
-          });
-        } catch (ee) {
-          activityLogger.logEvent("function_error", {
-            function: "generateBulkDocuments:NEWSLETTER",
-            years: chunk.map((c) => c.year),
-            error: String(err),
+        logger.error(`[${requestId}] Bulk NEWSLETTER generation failed`, err);
+        const saved = saveDebugResponse(requestId, String(err));
+        activityLogger.logEvent("parse_error", {
+          function: "generateBulkDocuments:NEWSLETTER",
+          requestId,
+          error: String(err),
+          savedResponsePath: saved,
+        });
+
+        // Fallback: generate placeholder docs for this chunk
+        for (const y of chunk) {
+          results.push({
+            id: `${DocumentType.NEWSLETTER}-${y.year}`,
+            type: DocumentType.NEWSLETTER,
+            year: y.year,
+            title: `社内報 ${y.year}年 (生成失敗)`,
+            content: `${y.year}年の社内報は生成に失敗しました。`,
           });
         }
-        // skip this chunk
+      }
+
+      // Rate limit delay between chunks
+      if (chunks.indexOf(chunk) < chunks.length - 1) {
+        await delay(1500);
       }
     }
   } else {
@@ -1592,7 +1420,55 @@ Return structure: { "newsletters": [ { "year": 2020, "content": "..." } ] }`;
     }
   }
 
+  logger.info("generateBulkDocuments completed", {
+    type,
+    totalGenerated: results.length,
+  });
+
   return results;
+};
+
+// Helper: Generate fallback JE sections when API fails
+const generateFallbackJESections = (yearData: YearlyData) => {
+  const monthNames = [
+    "4月",
+    "5月",
+    "6月",
+    "7月",
+    "8月",
+    "9月",
+    "10月",
+    "11月",
+    "12月",
+    "1月",
+    "2月",
+    "3月",
+  ];
+  const monthlyRevenue = Math.round(
+    ((yearData.revenue || 100) * 1_000_000) / 12
+  );
+
+  return monthNames.map((title) => ({
+    title,
+    breakPage: false,
+    headers: ["日付", "借方", "金額", "貸方", "金額", "摘要"],
+    items: [
+      {
+        date: "月末",
+        account: "売掛金",
+        debit: monthlyRevenue,
+        credit: 0,
+        label: "月次売上",
+      },
+      {
+        date: "月末",
+        account: "売上",
+        debit: 0,
+        credit: monthlyRevenue,
+        label: "月次売上計上",
+      },
+    ],
+  }));
 };
 
 // --- Single Document Generation (Heavy docs: JE, Newsletter) ---

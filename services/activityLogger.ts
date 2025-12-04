@@ -10,16 +10,22 @@ let LOG_FILE: string | null = null;
 let fs: any = null;
 let path: any = null;
 
-if (isNode) {
-  // Use standard ESM imports at runtime for Node execution
-  // This keeps the file ESM-compatible while still allowing file writes in CLI runs.
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  fs = await import("fs");
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  path = await import("path");
-  LOG_DIR = path.join(process.cwd(), "debug", "logs");
-  LOG_FILE = path.join(LOG_DIR, "activity.log");
-}
+// Initialize file system modules for Node environment
+const initFs = async () => {
+  if (isNode && !fs) {
+    try {
+      fs = await import("fs");
+      path = await import("path");
+      LOG_DIR = path.join(process.cwd(), "debug", "logs");
+      LOG_FILE = path.join(LOG_DIR, "activity.log");
+    } catch (e) {
+      // ignore - running in browser
+    }
+  }
+};
+
+// Call init immediately
+initFs();
 
 const ensureDir = () => {
   if (!isNode || !fs || !LOG_DIR) return;
@@ -32,6 +38,10 @@ const ensureDir = () => {
 
 const timestamp = () => new Date().toISOString();
 
+// In-memory log buffer for debugging UI
+const logBuffer: any[] = [];
+const MAX_BUFFER_SIZE = 500;
+
 export const logEvent = (event: string, payload: EventPayload = {}) => {
   try {
     const entry = {
@@ -39,15 +49,22 @@ export const logEvent = (event: string, payload: EventPayload = {}) => {
       event,
       payload,
     };
+
+    // Always add to in-memory buffer
+    logBuffer.push(entry);
+    if (logBuffer.length > MAX_BUFFER_SIZE) {
+      logBuffer.shift();
+    }
+
     if (isNode && fs && LOG_FILE) {
       ensureDir();
       fs.appendFileSync(LOG_FILE, JSON.stringify(entry) + "\n", {
         encoding: "utf-8",
       });
     } else {
-      // Browser fallback: write to console.debug to avoid breaking UI
+      // Browser fallback: write to console.debug
       // eslint-disable-next-line no-console
-      console.debug("activityLog (browser):", entry);
+      console.debug("activityLog:", entry);
     }
   } catch (e) {
     // eslint-disable-next-line no-console
@@ -55,4 +72,11 @@ export const logEvent = (event: string, payload: EventPayload = {}) => {
   }
 };
 
-export default { logEvent };
+// Export log buffer for debugging UI
+export const getLogBuffer = () => [...logBuffer];
+export const clearLogBuffer = () => {
+  logBuffer.length = 0;
+};
+export const exportLogs = () => JSON.stringify(logBuffer, null, 2);
+
+export default { logEvent, getLogBuffer, clearLogBuffer, exportLogs };

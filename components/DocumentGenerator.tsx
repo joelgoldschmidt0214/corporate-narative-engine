@@ -170,16 +170,19 @@ const DocumentGenerator: React.FC<Props> = ({ company, history, onBack }) => {
 
     // Estimation logic (chunk-aware):
     // Financials (BS/PL/CF) are generated locally (instant, 0s).
-    // Heavy docs (JE, Newsletter) are requested in chunks; use Vite env VITE_CHUNK_YEARS.
+    // Heavy docs (JE, Newsletter) are requested in chunks
     const heavyTypes = selectedTypes.filter(
       (t) => ![DocumentType.BS, DocumentType.PL, DocumentType.CF].includes(t)
     );
-    const CHUNK_YEARS = Number(process.env.VITE_CHUNK_YEARS) || 5;
-    const heavyCalls = Math.ceil(yearsCount / CHUNK_YEARS) * heavyTypes.length;
-    const AI_ESTIMATE_SECONDS = 120; // conservative per-AI-request estimate (seconds)
+    // Get chunk size from env (default 10)
+    const CHUNK_YEARS = Number(import.meta.env.VITE_CHUNK_YEARS) || 10;
+    const chunksNeeded = Math.ceil(yearsCount / CHUNK_YEARS);
+    const heavyCalls = chunksNeeded * heavyTypes.length;
+    // Each chunked API call takes ~10-30 seconds
+    const AI_ESTIMATE_SECONDS = 20;
     const estimatedSeconds = heavyCalls * AI_ESTIMATE_SECONDS;
 
-    return { totalDocs, estimatedSeconds };
+    return { totalDocs, estimatedSeconds, chunksNeeded, CHUNK_YEARS };
   }, [startYear, endYear, selectedTypes]);
 
   const openEditModal = (doc: GeneratedDocument) => {
@@ -419,48 +422,49 @@ const DocumentGenerator: React.FC<Props> = ({ company, history, onBack }) => {
     <div className="w-full max-w-7xl mx-auto space-y-6">
       <style>{sliderStyle}</style>
 
-      <div className="sticky top-16 z-20 bg-white/90 backdrop-blur-md shadow-sm border-b border-slate-200 -mx-4 px-4 py-3 flex justify-between items-center">
-        {generatedDocs.length > 0 ? (
-          <button
-            onClick={() => setGeneratedDocs([])}
-            className="flex items-center gap-2 px-4 py-2 bg-white text-slate-600 border border-slate-300 rounded-lg hover:bg-slate-50 font-bold text-sm"
-          >
-            <ArrowLeft className="w-4 h-4" />
-            条件変更
-          </button>
-        ) : (
-          <button
-            onClick={onBack}
-            className="flex items-center gap-2 px-4 py-2 bg-white text-slate-600 border border-slate-300 rounded-lg hover:bg-slate-50 font-bold text-sm"
-          >
-            <ArrowLeft className="w-4 h-4" />
-            戻る
-          </button>
-        )}
-        <div className="flex gap-2 items-center">
-          {downloadButtons}
-          {isDownloading && (
-            <div className="flex items-center gap-2 text-sm text-slate-600">
-              <Loader2 className="w-4 h-4 animate-spin" />
-              <span>{downloadProgress || "処理中..."}</span>
-            </div>
+      <div className="sticky top-16 z-20 bg-white/90 backdrop-blur-md shadow-sm border-b border-slate-200 -mx-4 px-4 py-3">
+        <div className="flex justify-between items-center">
+          {generatedDocs.length > 0 ? (
+            <button
+              onClick={() => setGeneratedDocs([])}
+              className="flex items-center gap-2 px-4 py-2 bg-white text-slate-600 border border-slate-300 rounded-lg hover:bg-slate-50 font-bold text-sm"
+            >
+              <ArrowLeft className="w-4 h-4" />
+              条件変更
+            </button>
+          ) : (
+            <button
+              onClick={onBack}
+              className="flex items-center gap-2 px-4 py-2 bg-white text-slate-600 border border-slate-300 rounded-lg hover:bg-slate-50 font-bold text-sm"
+            >
+              <ArrowLeft className="w-4 h-4" />
+              戻る
+            </button>
+          )}
+          <div className="flex gap-2 items-center">{downloadButtons}</div>
+          {generatedDocs.length === 0 && (
+            <button
+              onClick={handleGenerate}
+              disabled={isGenerating}
+              className="flex items-center gap-2 px-6 py-2 bg-blue-600 text-white rounded-lg font-bold shadow-md hover:shadow-lg transition"
+            >
+              {isGenerating ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin" />{" "}
+                  {progress.currentDoc}
+                </>
+              ) : (
+                "一括生成"
+              )}
+            </button>
           )}
         </div>
-        {generatedDocs.length === 0 && (
-          <button
-            onClick={handleGenerate}
-            disabled={isGenerating}
-            className="flex items-center gap-2 px-6 py-2 bg-blue-600 text-white rounded-lg font-bold shadow-md hover:shadow-lg transition"
-          >
-            {isGenerating ? (
-              <>
-                <Loader2 className="w-4 h-4 animate-spin" />{" "}
-                {progress.currentDoc}
-              </>
-            ) : (
-              "一括生成"
-            )}
-          </button>
+        {/* ダウンロード進捗表示 - ボタンの下に配置 */}
+        {isDownloading && (
+          <div className="mt-2 flex items-center gap-2 text-sm text-slate-600 justify-end">
+            <Loader2 className="w-4 h-4 animate-spin" />
+            <span>{downloadProgress || "処理中..."}</span>
+          </div>
         )}
       </div>
 
@@ -592,6 +596,9 @@ const DocumentGenerator: React.FC<Props> = ({ company, history, onBack }) => {
               </div>
               <div className="font-bold text-lg">
                 約 {stats.estimatedSeconds} 秒
+              </div>
+              <div className="text-xs text-blue-500">
+                ({stats.chunksNeeded}チャンク × {stats.CHUNK_YEARS}年/chunk)
               </div>
             </div>
           </div>
